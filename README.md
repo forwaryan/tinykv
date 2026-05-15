@@ -24,6 +24,10 @@ The whole project is a skeleton code for a key-value server and a scheduler serv
   * Implement handlers of `KvGet`, `KvPrewrite`, and `KvCommit` requests.
   * Implement handlers of `KvScan`, `KvCheckTxnStatus`, `KvBatchRollback`, and `KvResolveLock` requests.
 
+## Local Study Notes
+
+This workspace also keeps a Chinese learning guide in [tinykv-understanding](tinykv-understanding/README.md). It maps Project 1-4 to Lab1-4, explains what each lab needs to implement, and lists the main files and test commands for every stage.
+
 ## Code Structure
 
 ![overview](doc/imgs/overview.png)

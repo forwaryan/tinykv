@@ -171,6 +171,15 @@ graph TB
 | B 部分 | raftstore 支持管理命令和 Region 分裂 | 让 TinyKV 真正能改副本、拆 Region |
 | C 部分 | 调度器 | 调度器观察集群，然后告诉节点搬副本 |
 
+对应到测试命令：
+
+| 命令 | 所属阶段 | 要证明什么 |
+|---|---|---|
+| `make project3a` | Lab3A | Raft 模块支持 conf change 和 leader transfer |
+| `make project3b` | Lab3B | raftstore 能执行 ChangePeer、TransferLeader、Split，并维护 Region 元信息 |
+| `make project3c` | Lab3C | scheduler 能处理 Region heartbeat，并生成 balance-region operator |
+| `make project3` | Lab3 全部 | A/B/C 全部通过 |
+
 ## A 部分：Raft 组成员变化
 
 Lab2 里可以先理解成：一个 Raft 组的成员基本固定。Lab3 开始要支持动态变化。
@@ -367,6 +376,16 @@ sequenceDiagram
 
 记住一句话就行：leader transfer 不搬数据、不改 Peer 列表，所以不会增加 `conf_ver`；它只是把同一个 Region 的 leader 换到另一个 Peer 上。
 
+Lab3A 主要改 Raft 层：
+
+| 文件 | 主要任务 |
+|---|---|
+| `raft/raft.go` | 处理 `MsgTransferLeader`、`MsgTimeoutNow`，实现 `addNode`、`removeNode`，成员变化后更新 `Prs` |
+| `raft/rawnode.go` | 实现 `ProposeConfChange`、`ApplyConfChange`、`TransferLeader` 这些给上层调用的接口 |
+| `proto/proto/eraftpb.proto` | 通常只需要理解已有消息和结构，不建议随便改协议 |
+
+这部分只是让 Raft 算法“具备能力”，真正把 Region 元信息改掉是在 Lab3B。
+
 ## B 部分：Region 分裂
 
 一个 Region 太大时，要拆成两个 Region。
@@ -505,6 +524,17 @@ sequenceDiagram
 2. Split 最终也要作为 Raft admin command 提交，提交后才更新 Region 元信息。
 ```
 
+Lab3B 主要改 raftstore：
+
+| 文件 | 主要任务 |
+|---|---|
+| `kv/raftstore/peer_msg_handler.go` | propose/apply admin command：`TransferLeader`、`ChangePeer`、`Split` |
+| `kv/raftstore/peer.go` | 创建新 Peer、destroy 被移除 Peer、维护 callback 和 Peer 状态 |
+| `kv/raftstore/router.go` | 理解多个 Region/Peer 如何路由消息，通常更多是读懂框架 |
+| `kv/raftstore/runner/split_check.go` | 理解 split key 如何产生，通常框架已给出 |
+
+这部分的核心不是“复制 value”，而是让 Region 的范围、Peer 列表、RegionEpoch、storeMeta、router 注册关系都在 Raft 提交后一起变正确。
+
 ## C 部分：调度器
 
 调度器有点像 TiKV 里的 PD。
@@ -577,6 +607,16 @@ graph LR
 ```
 
 这张图能看出 C 部分和 A 部分的关系：Scheduler 只是决定要搬，真正的搬迁动作还是靠 A 部分的 `AddPeer`、`RemovePeer`、`TransferLeader`。
+
+Lab3C 主要改 scheduler：
+
+| 文件 | 主要任务 |
+|---|---|
+| `scheduler/server/cluster.go` | `processRegionHeartbeat`：接收 Region 心跳，过滤过期 epoch，更新 region tree 和 store 状态 |
+| `scheduler/server/schedulers/balance_region.go` | `Schedule`：找出 region 过多的 store，把合适的 Region 迁到更空的 store |
+| `scheduler/server/schedule/operator` | 理解 `MovePeer` operator 如何拆成 AddPeer / TransferLeader / RemovePeer |
+
+一句话：Lab3B 是节点执行管理命令，Lab3C 是调度器决定该给哪些节点发管理命令。
 
 ## A/B/C 串起来看
 

@@ -21,6 +21,7 @@ make project4
 make project2aa
 make project2ab
 make project2ac
+make project2a
 make project2b
 make project2c
 
@@ -99,8 +100,18 @@ make project2
 | `make project2aa` | Raft 选主、投票、心跳 |
 | `make project2ab` | 日志复制、日志冲突、提交 |
 | `make project2ac` | Raft 和上层交互的接口 |
+| `make project2a` | Part A 整体，也就是 2AA/2AB/2AC 全部一起跑 |
 | `make project2b` | KV 请求是否经过 Raft 后再执行 |
 | `make project2c` | 快照、日志压缩、落后副本恢复 |
+
+`project2aa`、`project2ab`、`project2ac` 都属于 `project2a`。所以看进度时可以这样理解：
+
+```text
+project2aa 过了：选主部分基本 OK
+project2ab 过了：日志复制部分基本 OK
+project2ac 过了：RawNode 接口部分基本 OK
+project2a 过了：Lab2A 才算整体 OK
+```
 
 主要测试文件：
 

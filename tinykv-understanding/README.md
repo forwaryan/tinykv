@@ -33,7 +33,26 @@ graph LR
 | [Lab3：Multi-Raft](./labs/lab3-multiraftkv.md) | 一个大 Raft group 变成多个 Region，每个 Region 有自己的 Peer、Raft group、split 和调度流程 |
 | [Lab4：事务](./labs/lab4-transactions.md) | 在 KV 之上实现 MVCC / Percolator 风格事务，用 `default`、`write`、`lock` 三个 CF 管理版本和锁 |
 | [测试指南](./labs/testing-guide.md) | 每个 Lab 跑什么 `make projectX` 命令，测试大概在检查哪些场景 |
-| [参考实现阅读路线](./reference-implementation.md) | 旧会话里筛出的完整实现参考，以及每个 Lab 应该优先对照哪些源码文件 |
+| [Lab 总路线](./labs/tinykv-lab-roadmap.md) | 按 Lab 串起来看：每一层在上一层基础上新增什么能力 |
+
+## Project / Lab 对照
+
+TinyKV 官方文档叫 `Project 1/2/3/4`，我们平时说的 `Lab1/2/3/4` 就对应这些 Project。最容易混的是 Lab2：`project2a` 是 Part A 整体，`project2aa`、`project2ab`、`project2ac` 是 Part A 里面的三个小检查点。
+
+| Lab | 官方 Project | 要完成什么 | 测试入口 |
+|---|---|---|---|
+| Lab1 | Project1 StandaloneKV | 单机存储层 + Raw KV API | `make project1` |
+| Lab2A | Project2 Part A | Raft 本体：选主、日志复制、RawNode/Ready | `make project2aa`、`make project2ab`、`make project2ac`、`make project2a` |
+| Lab2B | Project2 Part B | 把 KV 请求接到 Raft：propose、persist、apply、callback | `make project2b` |
+| Lab2C | Project2 Part C | Raft log GC、snapshot 发送和恢复 | `make project2c` |
+| Lab3A | Project3 Part A | Raft 成员变更和 leader transfer | `make project3a` |
+| Lab3B | Project3 Part B | raftstore 处理 ChangePeer、TransferLeader、Region Split | `make project3b` |
+| Lab3C | Project3 Part C | Scheduler 收集 heartbeat 并生成 balance operator | `make project3c` |
+| Lab4A | Project4 Part A | MVCC 存储层：lock/write/default 三个 CF 的读写工具 | `make project4a` |
+| Lab4B | Project4 Part B | `KvGet`、`KvPrewrite`、`KvCommit` | `make project4b` |
+| Lab4C | Project4 Part C | `KvScan`、`KvCheckTxnStatus`、`KvBatchRollback`、`KvResolveLock` | `make project4c` |
+
+判断一个阶段有没有完成，优先看对应的最大测试入口。比如只过了 `project2aa`，说明 Lab2A 的选主部分过了；要说 Lab2A 完成，需要 `make project2a` 通过。
 
 ## 请求路径
 

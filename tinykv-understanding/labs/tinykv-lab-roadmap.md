@@ -20,6 +20,21 @@ Lab1: 单机 KV
   -> Lab4: MVCC / Percolator 事务
 ```
 
+把官方 Project、测试命令、代码范围放到一张表里：
+
+| Lab | 官方阶段 | 主要工作 | 主要测试 |
+|---|---|---|---|
+| Lab1 | Project1 | `StandaloneStorage` + Raw KV API | `make project1` |
+| Lab2A | Project2 Part A | Raft 选主、日志复制、RawNode/Ready | `make project2aa`、`project2ab`、`project2ac`、`project2a` |
+| Lab2B | Project2 Part B | raftstore 把 KV 请求走 Raft 后再 apply | `make project2b` |
+| Lab2C | Project2 Part C | log GC、snapshot、落后副本恢复 | `make project2c` |
+| Lab3A | Project3 Part A | conf change、leader transfer | `make project3a` |
+| Lab3B | Project3 Part B | ChangePeer、TransferLeader、Region Split | `make project3b` |
+| Lab3C | Project3 Part C | scheduler heartbeat、balance region | `make project3c` |
+| Lab4A | Project4 Part A | MVCC 版本、锁、提交记录 | `make project4a` |
+| Lab4B | Project4 Part B | `KvGet`、`KvPrewrite`、`KvCommit` | `make project4b` |
+| Lab4C | Project4 Part C | `KvScan`、rollback、check/resolve lock | `make project4c` |
+
 和 MIT 6.5840 的大致关系：
 
 ```text
@@ -230,16 +245,15 @@ TinyKV Lab2 Part B ~= MIT Lab4 RaftKV
 TinyKV Lab2 Part C ~= MIT Lab3/4 的 snapshot
 ```
 
-待继续细化：
+具体拆开看：
 
-- leader election
-- log replication
-- RawNode / Ready 接口
-- PeerStorage
-- RaftStorage
-- raftstore ready 处理
-- apply committed entries
-- snapshot 发送与恢复
+| 阶段 | 要做什么 | 主要文件 |
+|---|---|---|
+| Lab2A / 2AA | 选主、投票、心跳、leader noop | `raft/raft.go` |
+| Lab2A / 2AB | 日志复制、日志冲突处理、推进 commit | `raft/log.go`、`raft/raft.go` |
+| Lab2A / 2AC | `RawNode`、`Ready`、`Advance` | `raft/rawnode.go` |
+| Lab2B | 持久化 `Ready`，propose/apply KV command，回调客户端 | `kv/raftstore/peer_storage.go`、`kv/raftstore/peer_msg_handler.go` |
+| Lab2C | CompactLog、raftlog GC、snapshot 发送和恢复 | `raft/raft.go`、`kv/raftstore/peer_storage.go`、`kv/raftstore/peer_msg_handler.go` |
 
 ## Lab3: MultiRaftKV
 
@@ -261,15 +275,13 @@ TinyKV Lab3 和 MIT Lab5 都在做“分片 + 多组复制”
 TinyKV 是 range region + split + scheduler，更像 TiKV
 ```
 
-待继续细化：
+具体拆开看：
 
-- AddNode / RemoveNode
-- TransferLeader
-- RegionEpoch
-- Region split
-- key range `[start_key, end_key)`
-- scheduler heartbeat
-- balance region operator
+| 阶段 | 要做什么 | 主要文件 |
+|---|---|---|
+| Lab3A | Raft 层支持 `AddNode`、`RemoveNode`、`TransferLeader` | `raft/raft.go`、`raft/rawnode.go` |
+| Lab3B | raftstore 执行 `ChangePeer`、`TransferLeader`、`Split`，维护 RegionEpoch 和 meta | `kv/raftstore/peer_msg_handler.go`、`kv/raftstore/peer.go` |
+| Lab3C | Scheduler 接收 heartbeat，判断 Region 信息新旧，生成 `MovePeer` operator | `scheduler/server/cluster.go`、`scheduler/server/schedulers/balance_region.go` |
 
 ## Lab4: Transactions
 
@@ -290,15 +302,10 @@ MIT 6.5840 标准实验基本没有这一层
 这是 TinyKV 更数据库内核的部分
 ```
 
-待继续细化：
+具体拆开看：
 
-- start timestamp
-- commit timestamp
-- snapshot isolation
-- default/write/lock 三个 CF
-- Prewrite
-- Commit
-- primary key lock
-- write conflict
-- rollback
-- resolve lock
+| 阶段 | 要做什么 | 主要文件 |
+|---|---|---|
+| Lab4A | 实现 MVCC 工具：按 `start_ts` 读可见版本，读写 lock/write/default | `kv/transaction/mvcc/transaction.go`、`kv/transaction/mvcc/scanner.go` |
+| Lab4B | 实现事务正常路径：`KvGet`、`KvPrewrite`、`KvCommit` | `kv/server/server.go` |
+| Lab4C | 实现异常和收尾路径：`KvScan`、`KvCheckTxnStatus`、`KvBatchRollback`、`KvResolveLock` | `kv/server/server.go`、`kv/transaction/mvcc/scanner.go` |

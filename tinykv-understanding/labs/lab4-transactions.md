@@ -222,6 +222,17 @@ graph LR
     B --> C["Part C<br/>Scan / Rollback / ResolveLock<br/>异常和收尾流程"]
 ```
 
+对应到测试命令和代码范围：
+
+| 命令 | 所属阶段 | 主要文件 | 要证明什么 |
+|---|---|---|---|
+| `make project4a` | Lab4A | `kv/transaction/mvcc/transaction.go`、`kv/transaction/mvcc/scanner.go` | MVCC 底层能正确读写 lock/write/default，能按时间戳找可见版本 |
+| `make project4b` | Lab4B | `kv/server/server.go` | `KvGet`、`KvPrewrite`、`KvCommit` 能跑通事务正常路径 |
+| `make project4c` | Lab4C | `kv/server/server.go`、`kv/transaction/mvcc/scanner.go` | `KvScan`、回滚、检查事务状态、处理遗留锁能工作 |
+| `make project4` | Lab4 全部 | 上面所有事务模块 | A/B/C 全部通过 |
+
+Lab4 的代码容易看晕，可以先记住分层：`mvcc` 包提供“怎么操作版本和锁”的工具，`server.go` 里的事务 handler 负责“什么时候调用这些工具”。
+
 ## Part A：MVCC 存储层
 
 Part A 主要实现 `MvccTxn`。
@@ -245,6 +256,14 @@ Part A 常见方法可以按用途记：
 | 写提交记录 | 把 `Write` 写进 `write` CF 的 `key@commit_ts` |
 | 找可见版本 | 在 `write` CF 找 `commit_ts <= start_ts` 的最新记录 |
 | 找本事务记录 | 判断某个 `start_ts` 是否已经提交或回滚 |
+
+常见要补的文件：
+
+| 文件 | 主要任务 |
+|---|---|
+| `kv/transaction/mvcc/transaction.go` | `MvccTxn` 的读锁、写锁、写 value、写提交记录、查找 write/value 等方法 |
+| `kv/transaction/mvcc/scanner.go` | 按逻辑 key 扫描可见版本，跳过同一个 key 的旧版本 |
+| `kv/transaction/mvcc/lock.go`、`write.go` | 理解 `Lock` 和 `Write` 的编码格式，通常框架已给出 |
 
 Part A 的难点通常是读路径，因为你不是直接按 key 读 value，而是要：
 
@@ -651,6 +670,14 @@ Part B 要实现三个 gRPC handler，通常在 `kv/server/server.go` 里：
 ```
 
 本地并发层可以用 `latches`，它像每个 key 一把本地互斥锁，避免同一个 key 的 commit 和 rollback 在本地交叉执行。
+
+Part B 的正常事务路径可以压成一句：
+
+```text
+KvGet 负责按 start_ts 读快照；
+KvPrewrite 负责检查冲突，然后写 default + lock；
+KvCommit 负责把 lock 变成 write 记录，并删除 lock。
+```
 
 ## Part C：扫描、回滚、处理锁
 

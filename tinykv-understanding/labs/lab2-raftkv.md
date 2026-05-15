@@ -82,6 +82,20 @@ Part B 做“KV 请求怎么使用这个一致性”
 Part C 做“日志太多以后怎么减肥”
 ```
 
+官方测试命令的层级是这样：
+
+| 命令 | 所属阶段 | 要证明什么 |
+|---|---|---|
+| `make project2aa` | Lab2A 的第 1 小段 | 选主、投票、心跳能工作 |
+| `make project2ab` | Lab2A 的第 2 小段 | 日志复制、冲突处理、commit 能工作 |
+| `make project2ac` | Lab2A 的第 3 小段 | RawNode/Ready/Advance 这层接口能工作 |
+| `make project2a` | Lab2A 整体 | 上面三个小段一起过 |
+| `make project2b` | Lab2B | KV 请求真正经过 Raft 再 apply |
+| `make project2c` | Lab2C | log GC、snapshot、落后副本恢复 |
+| `make project2` | Lab2 全部 | A/B/C 全部通过 |
+
+所以 `2AA` 不是一个独立的大 Lab，它只是 `2A` 里的第一个检查点。过了 `2AA`，只能说明“选主这块基本通了”，还不能说 Lab2A 完成。
+
 ## A 部分：实现 Raft
 
 相关代码：
@@ -133,6 +147,16 @@ Raft 只负责判断：
 
 但它自己不真的发网络包，也不真的写 Badger。
 ```
+
+Lab2A 可以按三个文件层次拆：
+
+| 小阶段 | 重点文件 | 主要要写什么 |
+|---|---|---|
+| 2AA | `raft/raft.go` | `tick`、`Step`、`becomeFollower/Candidate/Leader`、投票、心跳、leader noop |
+| 2AB | `raft/log.go`、`raft/raft.go` | `RaftLog` 索引管理、AppendEntries、日志冲突截断、leader 更新 `Progress`、推进 commit |
+| 2AC | `raft/rawnode.go` | `RawNode` 封装、`Ready`、`HasReady`、`Advance`、HardState/SoftState 变化 |
+
+学习顺序建议也是这个顺序：先让集群能选主，再让 leader 能复制日志，最后把 Raft 模块暴露给上层应用。
 
 ## B 部分：把 KV 请求放进 Raft
 
@@ -201,6 +225,17 @@ Lab2 先简化：
 
 Lab3 才会变成多个 Region。
 
+Lab2B 主要改的是 raftstore 外壳，不是 Raft 算法本身：
+
+| 文件 | 负责什么 |
+|---|---|
+| `kv/storage/raft_storage/raft_server.go` | 把 Raw API 的读写包装成 `RaftCmdRequest` 发给 raftstore |
+| `kv/raftstore/peer_storage.go` | `SaveReadyState`，把 `Ready` 里的日志和 HardState 持久化到 raftdb |
+| `kv/raftstore/peer_msg_handler.go` | `proposeRaftCommand`、`HandleRaftReady`，处理 propose、persist、send、apply、callback |
+| `kv/raftstore/peer.go` | Peer 状态和 callback 管理，理解为 raftstore 里的单个 Region 副本 |
+
+这部分的核心检查点是：客户端的 `Get/Put/Delete/Snap` 不能绕过 Raft，必须被包装成 Raft log，commit 后才 apply 到 Badger。
+
 ## C 部分：快照和日志压缩
 
 Raft 日志不能一直增长。否则系统跑久了，日志会越来越大。
@@ -223,6 +258,16 @@ Raft 日志不能一直增长。否则系统跑久了，日志会越来越大。
   -> 把快照发给从节点
   -> 从节点用快照恢复状态
 ```
+
+Lab2C 是在 A/B 已经能跑起来之后，补长期运行必需的清理能力：
+
+| 模块 | 要处理什么 |
+|---|---|
+| Raft 层 | leader 在日志被截断后，必要时向落后 follower 发送 snapshot；follower 收到 snapshot 后恢复 Raft 状态 |
+| raftstore 层 | 处理 `CompactLog` admin command，更新 `RaftApplyState.TruncatedState`，调度 raftlog-gc worker 删除旧日志 |
+| PeerStorage | 生成、应用、持久化 snapshot 相关状态，并清理过期的 raft/kv 元数据 |
+
+一句话：Lab2B 让系统能复制请求，Lab2C 让这个复制系统跑久以后不会被无限增长的日志拖垮。
 
 ## 怎么测试
 
@@ -249,6 +294,7 @@ make project2c
 | `make project2aa` | 选主、投票、心跳 |
 | `make project2ab` | 日志复制、日志冲突、提交 |
 | `make project2ac` | Raft 和上层交互的接口 |
+| `make project2a` | Part A 整体，也就是 2AA/2AB/2AC 全部一起过 |
 | `make project2b` | KV 请求是否真的经过 Raft 后再执行 |
 | `make project2c` | 快照、日志压缩、落后副本恢复 |
 

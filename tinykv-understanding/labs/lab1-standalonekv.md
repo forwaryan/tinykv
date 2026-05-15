@@ -67,6 +67,14 @@ Lab1 的工作，就是把用户的“查、存、删、扫”翻译成 BadgerDB
 
 ## 要做哪两件事
 
+Lab1 对应官方 `Project1 StandaloneKV`，没有再拆成 A/B/C。交付标准很明确：
+
+| 阶段 | 要完成什么 | 主要文件 | 测试 |
+|---|---|---|---|
+| Project1 | 单机 Badger 存储封装 + Raw KV API | `kv/storage/standalone_storage/standalone_storage.go`、`kv/server/raw_api.go` | `make project1` |
+
+它的核心任务就是两层：下面的 `StandaloneStorage` 负责真正读写 Badger，上面的 Raw API 负责把 gRPC 请求翻译成 storage 的 `Reader` / `Write` 调用。
+
 ### 1. 做单机存储层
 
 相关代码：
