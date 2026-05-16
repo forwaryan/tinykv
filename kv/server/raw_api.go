@@ -7,10 +7,11 @@ import (
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 )
 
-// The functions below are Server's Raw API. (implements TinyKvServer).
-// Some helper methods can be found in sever.go in the current directory
+// 下面这些函数是 Server 暴露给客户端的 Raw KV API。
+// 它们负责把 RPC 请求转成 storage 层的读写操作。
 
-// RawGet return the corresponding Get response based on RawGetRequest's CF and Key fields
+// RawGet 根据请求里的 CF 和 Key 读取对应 value。
+// 它会创建 storage reader，从指定 CF 读取 key，并把 nil value 转成 NotFound 标记。
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
 	resp := &kvrpcpb.RawGetResponse{}
@@ -34,7 +35,8 @@ func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kv
 	return resp, nil
 }
 
-// RawPut puts the target data into storage and returns the corresponding response
+// RawPut 把请求里的 key/value 写入 storage。
+// 它把 RPC 请求转成 storage.Put，真正落盘交给当前配置的 Storage 实现。
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	// Your Code Here (1).
 	// Hint: Consider using Storage.Modify to store data to be modified
@@ -55,7 +57,8 @@ func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kv
 	return resp, nil
 }
 
-// RawDelete delete the target data from storage and returns the corresponding response
+// RawDelete 从 storage 中删除请求指定的 key。
+// 它把 RPC 请求转成 storage.Delete，并通过 Storage.Write 删除指定 CF 里的 key。
 func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest) (*kvrpcpb.RawDeleteResponse, error) {
 	// Your Code Here (1).
 	// Hint: Consider using Storage.Modify to store data to be deleted
@@ -75,7 +78,8 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 	return resp, nil
 }
 
-// RawScan scan the data starting from the start key up to limit. and return the corresponding result
+// RawScan 从 StartKey 开始顺序扫描，最多返回 Limit 个 key/value。
+// 它通过 CF 迭代器遍历数据，适合范围读取。
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
 	// Hint: Consider using reader.IterCF

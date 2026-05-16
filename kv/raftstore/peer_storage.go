@@ -23,7 +23,7 @@ import (
 )
 
 type ApplySnapResult struct {
-	// PrevRegion is the region before snapshot applied
+	// PrevRegion 是应用快照前的旧 Region。
 	PrevRegion *metapb.Region
 	Region     *metapb.Region
 }
@@ -31,26 +31,27 @@ type ApplySnapResult struct {
 var _ raft.Storage = new(PeerStorage)
 
 type PeerStorage struct {
-	// current region information of the peer
+	// 当前 peer 所属 Region 的元信息。
 	region *metapb.Region
-	// current raft state of the peer
+	// 当前 peer 的 Raft 本地状态。
 	raftState *rspb.RaftLocalState
-	// current apply state of the peer
+	// 当前 peer 的 apply 状态。
 	applyState *rspb.RaftApplyState
 
-	// current snapshot state
+	// 当前快照生成状态。
 	snapState snap.SnapState
-	// regionSched used to schedule task to region worker
+	// regionSched 用来向 region worker 投递任务。
 	regionSched chan<- worker.Task
-	// generate snapshot tried count
+	// 生成快照的重试次数。
 	snapTriedCnt int
-	// Engine include two badger instance: Raft and Kv
+	// Engines 包含 raftdb 和 kvdb 两个 Badger 实例。
 	Engines *engine_util.Engines
-	// Tag used for logging
+	// Tag 用于日志打印。
 	Tag string
 }
 
-// NewPeerStorage get the persist raftState from engines and return a peer storage
+// NewPeerStorage 从 engines 中读取持久化 raftState，并创建 PeerStorage。
+// Lab2B 会把 PeerStorage 作为某个 Region peer 背后的持久化 Storage 实现。
 func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task, tag string) (*PeerStorage, error) {
 	log.Debugf("%s creating storage for %s", tag, region.String())
 	raftState, err := meta.InitRaftLocalState(engines.Raft, region)
@@ -75,6 +76,8 @@ func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionS
 	}, nil
 }
 
+// InitialState 为 raft.NewRawNode 返回已持久化的 HardState 和 ConfState。
+// peer 启动或重启时会调用它恢复 Raft 状态。
 func (ps *PeerStorage) InitialState() (eraftpb.HardState, eraftpb.ConfState, error) {
 	raftState := ps.raftState
 	if raft.IsEmptyHardState(*raftState.HardState) {
@@ -86,6 +89,8 @@ func (ps *PeerStorage) InitialState() (eraftpb.HardState, eraftpb.ConfState, err
 	return *raftState.HardState, util.ConfStateFromRegion(ps.region), nil
 }
 
+// Entries 从 raftdb 读取 [low, high) 范围内的已持久化 Raft 日志。
+// 当 Raft 需要读取不只在内存里的稳定日志时会调用它。
 func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 	if err := ps.checkRange(low, high); err != nil || low == high {
 		return nil, err
@@ -126,6 +131,8 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 	return nil, raft.ErrUnavailable
 }
 
+// Term 返回指定日志 index 对应的 term。
+// compact 边界使用 truncated state，普通日志则从 raftdb 读取。
 func (ps *PeerStorage) Term(idx uint64) (uint64, error) {
 	if idx == ps.truncatedIndex() {
 		return ps.truncatedTerm(), nil
@@ -143,14 +150,18 @@ func (ps *PeerStorage) Term(idx uint64) (uint64, error) {
 	return entry.Term, nil
 }
 
+// LastIndex 返回该 peer 当前最高的已持久化 Raft 日志 index。
 func (ps *PeerStorage) LastIndex() (uint64, error) {
 	return ps.raftState.LastIndex, nil
 }
 
+// FirstIndex 返回 compact 之后仍然可读取的第一条日志 index。
 func (ps *PeerStorage) FirstIndex() (uint64, error) {
 	return ps.truncatedIndex() + 1, nil
 }
 
+// Snapshot 返回当前 Region 快照，或者触发一次快照生成。
+// Lab2C 中 follower 落后太多、无法靠普通日志追上时会用到它。
 func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 	var snapshot eraftpb.Snapshot
 	if ps.snapState.StateType == snap.SnapState_Generating {
@@ -194,18 +205,22 @@ func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 	return snapshot, raft.ErrSnapshotTemporarilyUnavailable
 }
 
+// isInitialized 判断当前 peer 是否已经有 Region peer 元信息。
 func (ps *PeerStorage) isInitialized() bool {
 	return len(ps.region.Peers) > 0
 }
 
+// Region 返回当前 peer 的 Region 元信息。
 func (ps *PeerStorage) Region() *metapb.Region {
 	return ps.region
 }
 
+// SetRegion 在 split 或 conf change 后更新当前 peer 的 Region 元信息。
 func (ps *PeerStorage) SetRegion(region *metapb.Region) {
 	ps.region = region
 }
 
+// checkRange 检查请求的日志范围是否可读，并且没有被 compact 掉。
 func (ps *PeerStorage) checkRange(low, high uint64) error {
 	if low > high {
 		return errors.Errorf("low %d is greater than high %d", low, high)
@@ -218,18 +233,22 @@ func (ps *PeerStorage) checkRange(low, high uint64) error {
 	return nil
 }
 
+// truncatedIndex 返回已经 compact 的日志边界 index。
 func (ps *PeerStorage) truncatedIndex() uint64 {
 	return ps.applyState.TruncatedState.Index
 }
 
+// truncatedTerm 返回 compact 边界 index 对应的 term。
 func (ps *PeerStorage) truncatedTerm() uint64 {
 	return ps.applyState.TruncatedState.Term
 }
 
+// AppliedIndex 返回已经 apply 到状态机的最高日志 index。
 func (ps *PeerStorage) AppliedIndex() uint64 {
 	return ps.applyState.AppliedIndex
 }
 
+// validateSnap 检查生成出来的快照对当前 Region 是否仍然可用。
 func (ps *PeerStorage) validateSnap(snap *eraftpb.Snapshot) bool {
 	idx := snap.GetMetadata().GetIndex()
 	if idx < ps.truncatedIndex() {
@@ -250,11 +269,12 @@ func (ps *PeerStorage) validateSnap(snap *eraftpb.Snapshot) bool {
 	return true
 }
 
+// clearMeta 删除当前 peer 的所有持久化元信息。
 func (ps *PeerStorage) clearMeta(kvWB, raftWB *engine_util.WriteBatch) error {
 	return ClearMeta(ps.Engines, kvWB, raftWB, ps.region.Id, ps.raftState.LastIndex)
 }
 
-// Delete all data that is not covered by `new_region`.
+// clearExtraData 删除旧 Region 中不再属于 newRegion 的数据范围。
 func (ps *PeerStorage) clearExtraData(newRegion *metapb.Region) {
 	oldStartKey, oldEndKey := ps.region.GetStartKey(), ps.region.GetEndKey()
 	newStartKey, newEndKey := newRegion.GetStartKey(), newRegion.GetEndKey()
@@ -266,7 +286,7 @@ func (ps *PeerStorage) clearExtraData(newRegion *metapb.Region) {
 	}
 }
 
-// ClearMeta delete stale metadata like raftState, applyState, regionState and raft log entries
+// ClearMeta 删除过期元信息，比如 raftState、applyState、regionState 和 raft log entries。
 func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatch, regionID uint64, lastIndex uint64) error {
 	start := time.Now()
 	kvWB.DeleteMeta(meta.RegionStateKey(regionID))
@@ -304,14 +324,15 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 	return nil
 }
 
-// Append the given entries to the raft log and update ps.raftState also delete log entries that will
-// never be committed
+// Append 把给定 entries 写入 raft log，并更新 ps.raftState。
+// Lab2B 会在这里持久化 Ready.Entries，并删除被 Raft 覆盖的旧冲突后缀。
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
 	return nil
 }
 
-// Apply the peer with given snapshot
+// ApplySnapshot 把给定快照应用到当前 peer。
+// Lab2C 会在这里安装快照元信息、调度 KV 快照应用任务，并清理新 Region 外的旧数据。
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
@@ -326,18 +347,21 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	return nil, nil
 }
 
-// Save memory states to disk.
-// Do not modify ready in this function, this is a requirement to advance the ready object properly later.
+// SaveReadyState 把 Ready 中的内存状态保存到磁盘。
+// 注意：这里不能修改 ready 本身，否则后续 Advance 会拿不到正确的 Ready 信息。
+// Lab2B/2C 会在这里先保存 HardState、entries 和 snapshot，再允许发送消息。
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
 	return nil, nil
 }
 
+// ClearData 删除当前 peer 对应 Region 的 KV 数据范围。
 func (ps *PeerStorage) ClearData() {
 	ps.clearRange(ps.region.GetId(), ps.region.GetStartKey(), ps.region.GetEndKey())
 }
 
+// clearRange 向 region worker 发送异步销毁任务，删除指定 Region key range。
 func (ps *PeerStorage) clearRange(regionID uint64, start, end []byte) {
 	ps.regionSched <- &runner.RegionTaskDestroy{
 		RegionId: regionID,

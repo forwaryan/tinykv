@@ -16,14 +16,14 @@ package raft
 
 import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 
-// RaftLog manage the log entries, its struct look like:
+// RaftLog 管理 Raft 日志以及 committed/applied/stabled 这些关键游标。
+// 它的大致结构如下：
 //
 //	snapshot/first.....applied....committed....stabled.....last
 //	--------|------------------------------------------------|
 //	                          log entries
 //
-// for simplify the RaftLog implement should manage all log entries
-// that not truncated
+// 为了简化实现，RaftLog 会在内存里管理所有还没有被 compact 的日志。
 type RaftLog struct {
 	// storage contains all stable entries since the last snapshot.
 	storage Storage
@@ -52,8 +52,9 @@ type RaftLog struct {
 	// Your Data Here (2A).
 }
 
-// newLog returns log using the given storage. It recovers the log
-// to the state that it just commits and applies the latest snapshot.
+// newLog 根据持久化 storage 初始化 RaftLog。
+// 它会把已有日志加载到内存，并在 FirstIndex-1 放一个 dummy entry，
+// 这样后续从 raft index 映射到 entries 切片下标会更简单。
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	firstIndex, err := storage.FirstIndex()
@@ -92,22 +93,21 @@ func newLog(storage Storage) *RaftLog {
 	}
 }
 
-// We need to compact the log entries in some point of time like
-// storage compact stabled log entries prevent the log entries
-// grow unlimitedly in memory
+// maybeCompact 会在 Lab2C 中负责丢弃已经被 storage compact 掉的内存日志。
+// 它的目的就是防止 RaftLog 在内存里无限增长，并和快照边界保持一致。
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 }
 
-// allEntries return all the entries not compacted.
-// note, exclude any dummy entries from the return value.
-// note, this is one of the test stub functions you need to implement.
+// allEntries 返回所有还没被 compact 的真实日志。
+// 注意：返回值不包含内部 dummy entry，测试会用它检查真实日志内容。
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
 	return l.entries[1:]
 }
 
-// unstableEntries return all the unstable entries
+// unstableEntries 返回所有还没有持久化的日志。
+// 这些日志位于 stabled 之后，RawNode.Ready 会把它们交给上层先写盘。
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	if l.stabled >= l.LastIndex() {
@@ -117,8 +117,8 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	return l.entries[l.stabled-offset+1:]
 }
 
-// nextEnts returns all the committed but not applied entries
-// 已经commit但是没有apply
+// nextEnts 返回已经 committed 但还没有 applied 的日志。
+// RawNode.Ready 会把这些日志交给上层按顺序 apply 到状态机。
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	if l.applied >= l.committed {
@@ -128,13 +128,15 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	return l.entries[l.applied-offset+1 : l.committed-offset+1]
 }
 
-// LastIndex return the last index of the log entries
+// LastIndex 返回当前 RaftLog 的最后一条日志 index。
+// Raft 会用它决定新日志应该追加到哪里。
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
 
-// Term return the term of the entry in the given index
+// Term 返回指定日志 index 对应的 term。
+// Raft 在投票和 AppendEntries 日志匹配时都会用它。
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	offset := l.entries[0].Index
@@ -148,6 +150,9 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	return l.entries[i-offset].Term, nil
 }
 
+// appendEntries 把 leader 发来的日志合并进本地内存日志。
+// 已匹配的前缀会保留，冲突后缀会截断，新追加的日志会保持 unstable，
+// 直到后续 Ready/Advance 标记为已持久化。
 func (l *RaftLog) appendEntries(ents []*pb.Entry) {
 	if len(ents) == 0 {
 		return

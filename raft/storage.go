@@ -22,28 +22,20 @@ import (
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
-// ErrCompacted is returned by Storage.Entries/Compact when a requested
-// index is unavailable because it predates the last snapshot.
+// ErrCompacted 表示请求的日志 index 已经被 compact 掉了。
 var ErrCompacted = errors.New("requested index is unavailable due to compaction")
 
-// ErrSnapOutOfDate is returned by Storage.CreateSnapshot when a requested
-// index is older than the existing snapshot.
+// ErrSnapOutOfDate 表示请求创建或应用的快照比当前快照更旧。
 var ErrSnapOutOfDate = errors.New("requested index is older than the existing snapshot")
 
-// ErrUnavailable is returned by Storage interface when the requested log entries
-// are unavailable.
+// ErrUnavailable 表示请求的日志当前不可用。
 var ErrUnavailable = errors.New("requested entry at index is unavailable")
 
-// ErrSnapshotTemporarilyUnavailable is returned by the Storage interface when the required
-// snapshot is temporarily unavailable.
+// ErrSnapshotTemporarilyUnavailable 表示快照正在生成，暂时还不能返回。
 var ErrSnapshotTemporarilyUnavailable = errors.New("snapshot is temporarily unavailable")
 
-// Storage is an interface that may be implemented by the application
-// to retrieve log entries from storage.
-//
-// If any Storage method returns an error, the raft instance will
-// become inoperable and refuse to participate in elections; the
-// application is responsible for cleanup and recovery in this case.
+// Storage 是 Raft 读取持久化日志、HardState、ConfState 和快照的接口。
+// Lab2A 用 MemoryStorage 测试；Lab2B 会用 PeerStorage 接到真实 raftdb。
 type Storage interface {
 	// InitialState returns the saved HardState and ConfState information.
 	InitialState() (pb.HardState, pb.ConfState, error)
@@ -70,8 +62,7 @@ type Storage interface {
 	Snapshot() (pb.Snapshot, error)
 }
 
-// MemoryStorage implements the Storage interface backed by an
-// in-memory array.
+// MemoryStorage 是基于内存数组的 Storage 实现，主要用于 Raft 单元测试。
 type MemoryStorage struct {
 	// Protects access to all fields. Most methods of MemoryStorage are
 	// run on the raft goroutine, but Append() is run on an application
@@ -84,7 +75,8 @@ type MemoryStorage struct {
 	ents []pb.Entry
 }
 
-// NewMemoryStorage creates an empty MemoryStorage.
+// NewMemoryStorage 创建一个空的内存 Storage。
+// 测试和内存 Raft 节点会把它作为 RaftLog 后面的稳定存储。
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
 		// When starting from scratch populate the list with a dummy entry at term zero.
@@ -93,12 +85,13 @@ func NewMemoryStorage() *MemoryStorage {
 	}
 }
 
-// InitialState implements the Storage interface.
+// InitialState 返回节点启动或重启时需要恢复的 HardState 和 ConfState。
 func (ms *MemoryStorage) InitialState() (pb.HardState, pb.ConfState, error) {
 	return ms.hardState, *ms.snapshot.Metadata.ConfState, nil
 }
 
-// SetHardState saves the current HardState.
+// SetHardState 保存当前 HardState。
+// 当 Ready 暴露出 term、vote 或 commit 变化后，上层会调用它持久化状态。
 func (ms *MemoryStorage) SetHardState(st pb.HardState) error {
 	ms.Lock()
 	defer ms.Unlock()
@@ -106,7 +99,8 @@ func (ms *MemoryStorage) SetHardState(st pb.HardState) error {
 	return nil
 }
 
-// Entries implements the Storage interface.
+// Entries 返回 [lo, hi) 范围内的已持久化日志。
+// 如果请求范围已经 compact 或超过 last index，会返回错误。
 func (ms *MemoryStorage) Entries(lo, hi uint64) ([]pb.Entry, error) {
 	ms.Lock()
 	defer ms.Unlock()
@@ -126,7 +120,8 @@ func (ms *MemoryStorage) Entries(lo, hi uint64) ([]pb.Entry, error) {
 	return ents, nil
 }
 
-// Term implements the Storage interface.
+// Term 返回某个已持久化日志 index 对应的 term。
+// Raft 在投票和 AppendEntries 日志匹配时需要它。
 func (ms *MemoryStorage) Term(i uint64) (uint64, error) {
 	ms.Lock()
 	defer ms.Unlock()
@@ -140,37 +135,41 @@ func (ms *MemoryStorage) Term(i uint64) (uint64, error) {
 	return ms.ents[i-offset].Term, nil
 }
 
-// LastIndex implements the Storage interface.
+// LastIndex 返回当前最高的已持久化日志 index。
 func (ms *MemoryStorage) LastIndex() (uint64, error) {
 	ms.Lock()
 	defer ms.Unlock()
 	return ms.lastIndex(), nil
 }
 
+// lastIndex 返回内存中最高日志 index，不负责加锁。
+// 直接调用它的地方必须已经持有 mutex。
 func (ms *MemoryStorage) lastIndex() uint64 {
 	return ms.ents[0].Index + uint64(len(ms.ents)) - 1
 }
 
-// FirstIndex implements the Storage interface.
+// FirstIndex 返回 compact 之后仍然可读取的第一条真实日志 index。
 func (ms *MemoryStorage) FirstIndex() (uint64, error) {
 	ms.Lock()
 	defer ms.Unlock()
 	return ms.firstIndex(), nil
 }
 
+// firstIndex 返回第一条可读日志 index，不负责加锁。
+// 它前一条 entry 是 dummy entry，也就是快照/compact 边界。
 func (ms *MemoryStorage) firstIndex() uint64 {
 	return ms.ents[0].Index + 1
 }
 
-// Snapshot implements the Storage interface.
+// Snapshot 返回当前 storage 保存的最新快照。
 func (ms *MemoryStorage) Snapshot() (pb.Snapshot, error) {
 	ms.Lock()
 	defer ms.Unlock()
 	return ms.snapshot, nil
 }
 
-// ApplySnapshot overwrites the contents of this Storage object with
-// those of the given snapshot.
+// ApplySnapshot 用给定快照覆盖当前 Storage 内容。
+// Lab2C 中 follower 接受 leader 快照后会使用它；旧日志会被替换成快照 index 上的 dummy entry。
 func (ms *MemoryStorage) ApplySnapshot(snap pb.Snapshot) error {
 	ms.Lock()
 	defer ms.Unlock()
@@ -187,10 +186,8 @@ func (ms *MemoryStorage) ApplySnapshot(snap pb.Snapshot) error {
 	return nil
 }
 
-// CreateSnapshot makes a snapshot which can be retrieved with Snapshot() and
-// can be used to reconstruct the state at that point.
-// If any configuration changes have been made since the last compaction,
-// the result of the last ApplyConfChange must be passed in.
+// CreateSnapshot 创建一个可以通过 Snapshot 读取的快照。
+// 它会记录快照元信息和可选状态机数据，但真正删除旧日志要交给 Compact。
 func (ms *MemoryStorage) CreateSnapshot(i uint64, cs *pb.ConfState, data []byte) (pb.Snapshot, error) {
 	ms.Lock()
 	defer ms.Unlock()
@@ -212,9 +209,8 @@ func (ms *MemoryStorage) CreateSnapshot(i uint64, cs *pb.ConfState, data []byte)
 	return ms.snapshot, nil
 }
 
-// Compact discards all log entries prior to compactIndex.
-// It is the application's responsibility to not attempt to compact an index
-// greater than raftLog.applied.
+// Compact 删除 compactIndex 之前的所有日志。
+// compactIndex 会变成新的 dummy entry，保留后续日志匹配需要的 term。
 func (ms *MemoryStorage) Compact(compactIndex uint64) error {
 	ms.Lock()
 	defer ms.Unlock()
@@ -235,9 +231,8 @@ func (ms *MemoryStorage) Compact(compactIndex uint64) error {
 	return nil
 }
 
-// Append the new entries to storage.
-// TODO (xiangli): ensure the entries are continuous and
-// entries[0].Index > ms.entries[0].Index
+// Append 把新的日志 entries 持久化到 storage。
+// 它会在必要时替换冲突的已持久化后缀，然后把新日志追加到末尾。
 func (ms *MemoryStorage) Append(entries []pb.Entry) error {
 	if len(entries) == 0 {
 		return nil

@@ -21,10 +21,10 @@ import (
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
-// None is a placeholder node ID used when there is no leader.
+// None 表示当前没有 leader 或没有投票对象。
 const None uint64 = 0
 
-// StateType represents the role of a node in a cluster.
+// StateType 表示一个 Raft 节点在集群里的角色。
 type StateType uint64
 
 const (
@@ -39,15 +39,16 @@ var stmap = [...]string{
 	"StateLeader",
 }
 
+// String 把 Raft 角色转成可读字符串，方便测试和调试。
 func (st StateType) String() string {
 	return stmap[uint64(st)]
 }
 
-// ErrProposalDropped is returned when the proposal is ignored by some cases,
-// so that the proposer can be notified and fail fast.
+// ErrProposalDropped 表示提案被当前节点丢弃。
+// 比如 follower 收到本该交给 leader 的 propose 时，可以用它快速返回失败。
 var ErrProposalDropped = errors.New("raft proposal dropped")
 
-// Config contains the parameters to start a raft.
+// Config 包含启动一个 Raft 节点需要的配置。
 type Config struct {
 	// ID is the identity of the local raft. ID cannot be 0.
 	ID uint64
@@ -82,6 +83,8 @@ type Config struct {
 	Applied uint64
 }
 
+// validate 在 newRaft 初始化状态机前检查配置是否合法。
+// 无效的 timeout 或 storage 配置会导致 Raft 无法正常选主或安全持久化日志。
 func (c *Config) validate() error {
 	if c.ID == None {
 		return errors.New("cannot use none as id")
@@ -102,8 +105,8 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// Progress represents a follower’s progress in the view of the leader. Leader maintains
-// progresses of all followers, and sends entries to the follower based on its progress.
+// Progress 表示 leader 视角下某个 follower 的日志复制进度。
+// leader 会根据 Match/Next 决定给 follower 从哪里继续发送日志。
 type Progress struct {
 	Match, Next uint64
 }
@@ -163,7 +166,9 @@ type Raft struct {
 	PendingConfIndex uint64
 }
 
-// newRaft return a raft peer with the given config
+// newRaft 根据配置创建一个 Raft 节点。
+// 它会从 storage 恢复 HardState/ConfState，初始化 RaftLog 和 peer Progress，
+// 并让节点以 follower 身份准备参与选举。
 func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
@@ -214,8 +219,8 @@ func newRaft(c *Config) *Raft {
 	return r
 }
 
-// sendAppend sends an append RPC with new entries (if any) and the
-// current commit index to the given peer. Returns true if a message was sent.
+// sendAppend 给指定 peer 发送 AppendEntries 消息。
+// leader 用它做正常日志复制，也用它重试那些日志落后或发生冲突的 follower。
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	pr, ok := r.Prs[to]
@@ -251,7 +256,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 	return true
 }
 
-// sendHeartbeat sends a heartbeat RPC to the given peer.
+// sendHeartbeat 给指定 peer 发送心跳消息。
+// leader 用心跳维持自己的权威，并告诉 follower 当前最新的 committed index。
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
 	r.msgs = append(r.msgs, pb.Message{
@@ -263,7 +269,8 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	})
 }
 
-// tick advances the internal logical clock by a single tick.
+// tick 推进一次 Raft 内部逻辑时钟。
+// 上层定期调用它；follower/candidate 用它触发选举，leader 用它触发心跳。
 func (r *Raft) tick() {
 	// Your Code Here (2A).
 	switch r.State {
@@ -282,10 +289,14 @@ func (r *Raft) tick() {
 	}
 }
 
+// resetRandomizedElectionTimeout 重新生成随机选举超时时间。
+// 随机化可以减少多个 follower 同时发起选举、反复平票的概率。
 func (r *Raft) resetRandomizedElectionTimeout() {
 	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
+// isUpToDate 判断 candidate 的日志是否至少和本地一样新。
+// 投票时用它避免选出缺少已提交历史的 leader。
 func (r *Raft) isUpToDate(index uint64, term uint64) bool {
 	lastIndex := r.RaftLog.LastIndex()
 	lastTerm, err := r.RaftLog.Term(lastIndex)
@@ -299,11 +310,14 @@ func (r *Raft) isUpToDate(index uint64, term uint64) bool {
 	return index >= lastIndex
 }
 
+// quorum 返回达成多数派需要的票数或副本数。
+// Raft 选主和提交日志都依赖多数派。
 func (r *Raft) quorum() int {
 	return len(r.Prs)/2 + 1
 }
 
-// becomeFollower transform this peer's state to Follower
+// becomeFollower 把当前节点切换成 follower。
+// 它会记录 leader、更新 term、清空投票状态，并重置计时器。
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
 	if term != r.Term {
@@ -318,7 +332,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.resetRandomizedElectionTimeout()
 }
 
-// becomeCandidate transform this peer's state to candidate
+// becomeCandidate 把当前节点切换成 candidate。
+// 它会开启新 term、投自己一票、清空 leader，并准备统计投票响应。
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	r.State = StateCandidate
@@ -332,7 +347,9 @@ func (r *Raft) becomeCandidate() {
 	r.resetRandomizedElectionTimeout()
 }
 
-// becomeLeader transform this peer's state to leader
+// becomeLeader 把当前节点切换成 leader。
+// 它会初始化每个 peer 的复制进度，并在当前 term 追加一条 no-op 日志，
+// 这是 Raft 用来确立新 leader 权威的标准做法。
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
@@ -363,6 +380,9 @@ func (r *Raft) becomeLeader() {
 	r.Prs[r.id].Next = entry.Index + 1
 }
 
+// maybeCommit 尝试推进 leader 的 committed index。
+// 只有当前 term 的日志被多数派复制后，leader 才能直接提交它；
+// 一旦当前 term 日志提交，前面的旧 term 日志也会一起变成 committed。
 func (r *Raft) maybeCommit() bool {
 	oldCommitted := r.RaftLog.committed
 
@@ -394,8 +414,9 @@ func (r *Raft) maybeCommit() bool {
 	return r.RaftLog.committed != oldCommitted
 }
 
-// Step the entrance of handle message, see `MessageType`
-// on `eraftpb.proto` for what msgs should be handled
+// Step 是 Raft 处理消息的统一入口。
+// 本地触发和网络消息最终都会进入这里，并可能改变 term、角色、日志、
+// Progress、committed index 或待发送消息。
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	if m.Term > r.Term {
@@ -610,7 +631,9 @@ func (r *Raft) Step(m pb.Message) error {
 	return nil
 }
 
-// handleAppendEntries handle AppendEntries RPC request
+// handleAppendEntries 处理 leader 发来的 AppendEntries 请求。
+// follower 会在这里校验日志前缀、追加新日志、更新 committed index，
+// 并向 leader 回复成功或拒绝。
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 	if m.Term < r.Term {
@@ -656,7 +679,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	})
 }
 
-// handleHeartbeat handle Heartbeat RPC request
+// handleHeartbeat 处理 leader 发来的心跳请求。
+// follower 会在这里确认当前 term 的 leader，并回复心跳响应。
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
 	if m.Term < r.Term {
@@ -680,17 +704,21 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	})
 }
 
-// handleSnapshot handle Snapshot RPC request
+// handleSnapshot 处理 leader 发来的快照安装请求。
+// Lab2C 会在 follower 落后太多、无法靠普通日志追上时实现它。
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
 }
 
-// addNode add a new node to raft group
+// addNode 把一个新节点加入 Raft group。
+// Lab3A 会在配置变更日志提交后实现它，用来开始跟踪新 peer 的复制进度。
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
 }
 
-// removeNode remove a node from raft group
+// removeNode 从 Raft group 中移除一个节点。
+// Lab3A 会在配置变更日志提交后实现它，用来停止跟踪该 peer，
+// 并在必要时重新计算 commit 进度。
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
 }

@@ -20,6 +20,8 @@ import (
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/opt"
 )
 
+// init 注册 balance-region scheduler。
+// scheduler server 后续可以根据配置创建这个 scheduler。
 func init() {
 	schedule.RegisterSliceDecoderBuilder("balance-region", func(args []string) schedule.ConfigDecoder {
 		return func(v interface{}) error {
@@ -43,8 +45,7 @@ type balanceRegionScheduler struct {
 	opController *schedule.OperatorController
 }
 
-// newBalanceRegionScheduler creates a scheduler that tends to keep regions on
-// each store balanced.
+// newBalanceRegionScheduler 创建一个用于均衡各 store 上 Region 分布的 scheduler。
 func newBalanceRegionScheduler(opController *schedule.OperatorController, opts ...BalanceRegionCreateOption) schedule.Scheduler {
 	base := newBaseScheduler(opController)
 	s := &balanceRegionScheduler{
@@ -57,9 +58,10 @@ func newBalanceRegionScheduler(opController *schedule.OperatorController, opts .
 	return s
 }
 
-// BalanceRegionCreateOption is used to create a scheduler with an option.
+// BalanceRegionCreateOption 表示创建 balanceRegionScheduler 时的可选配置。
 type BalanceRegionCreateOption func(s *balanceRegionScheduler)
 
+// GetName 返回 scheduler 实例名，用于日志和 API 展示。
 func (s *balanceRegionScheduler) GetName() string {
 	if s.name != "" {
 		return s.name
@@ -67,14 +69,18 @@ func (s *balanceRegionScheduler) GetName() string {
 	return balanceRegionName
 }
 
+// GetType 返回 scheduler 注册时使用的类型名。
 func (s *balanceRegionScheduler) GetType() string {
 	return "balance-region"
 }
 
+// IsScheduleAllowed 判断当前是否还能继续创建 Region 调度 operator。
 func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 	return s.opController.OperatorCount(operator.OpRegion) < cluster.GetRegionScheduleLimit()
 }
 
+// Schedule 选择 source store、target store 和要移动的 Region。
+// Lab3C 会在这里实现真正的 Region 均衡决策。
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
 	// Your Code Here (3C).
 

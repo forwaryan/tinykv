@@ -276,7 +276,9 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 	return nil
 }
 
-// processRegionHeartbeat updates the region information.
+// processRegionHeartbeat 更新 scheduler 维护的 Region 信息。
+// Lab3C 会用 Region heartbeat 刷新 Region 范围、leader、peers、大小等元数据，
+// balance scheduler 后续会根据这些信息做调度。
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
 

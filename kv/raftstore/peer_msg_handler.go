@@ -31,6 +31,8 @@ type peerMsgHandler struct {
 	ctx *GlobalContext
 }
 
+// newPeerMsgHandler 把一个 peer 和共享 raftstore 上下文绑定起来。
+// 这样它就能处理 Raft 消息、tick、客户端提案、split 和 snapshot 相关任务。
 func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	return &peerMsgHandler{
 		peer: peer,
@@ -38,6 +40,9 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+// HandleRaftReady 是 Lab2B 中从 RawNode.Ready 接到 raftstore 的桥。
+// 它应该持久化 Ready 状态、发送 Raft 消息、apply 已提交命令，
+// 最后调用 RawNode.Advance。
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
@@ -45,6 +50,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	// Your Code Here (2B).
 }
 
+// HandleMsg 根据消息类型分发到对应的 peer 处理逻辑。
+// Raft 网络消息、客户端命令、tick、split 检查、Region size 上报和 snapshot GC 都从这里进入。
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
@@ -71,6 +78,8 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	}
 }
 
+// preProposeRaftCommand 在请求进入 Raft 前做合法性检查。
+// 它会检查 store、peer、leader、term 和 Region epoch，避免过期请求变成日志。
 func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) error {
 	// Check store_id, make sure that the msg is dispatched to the right place.
 	if err := util.CheckStoreID(req, d.storeID()); err != nil {
@@ -107,6 +116,9 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
+// proposeRaftCommand 是 Lab2B 中把客户端/admin 命令提交进 Raft 的入口。
+// 它会序列化已验证的命令，propose 到当前 Region 的 Raft group，
+// 并保存 callback，等日志 apply 后再回调客户端。
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
@@ -116,6 +128,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	// Your Code Here (2B).
 }
 
+// onTick 推进 peer 级别的周期任务，并重新安排下一轮 tick。
 func (d *peerMsgHandler) onTick() {
 	if d.stopped {
 		return
@@ -136,6 +149,7 @@ func (d *peerMsgHandler) onTick() {
 	d.ctx.tickDriverSender <- d.regionId
 }
 
+// startTicker 初始化周期任务，包括 Raft tick、日志 GC、split 检查和 scheduler heartbeat。
 func (d *peerMsgHandler) startTicker() {
 	d.ticker = newTicker(d.regionId, d.ctx.cfg)
 	d.ctx.tickDriverSender <- d.regionId
@@ -145,11 +159,13 @@ func (d *peerMsgHandler) startTicker() {
 	d.ticker.schedule(PeerTickSchedulerHeartbeat)
 }
 
+// onRaftBaseTick 推进底层 RawNode 的逻辑时钟。
 func (d *peerMsgHandler) onRaftBaseTick() {
 	d.RaftGroup.Tick()
 	d.ticker.schedule(PeerTickRaft)
 }
 
+// ScheduleCompactLog 发送异步任务，删除 apply state 已经 compact 掉的 Raft 日志。
 func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 	raftLogGCTask := &runner.RaftLogGCTask{
 		RaftEngine: d.ctx.engine.Raft,
@@ -161,6 +177,8 @@ func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 	d.ctx.raftLogGCTaskSender <- raftLogGCTask
 }
 
+// onRaftMsg 校验外部收到的 Raft 网络消息，并把它 Step 进 RawNode。
+// snapshot 消息会先做额外检查，避免过期或冲突快照进入 Raft。
 func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 	log.Debugf("%s handle raft message %s from %d to %d",
 		d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
@@ -205,7 +223,8 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 	return nil
 }
 
-// return false means the message is invalid, and can be ignored.
+// validateRaftMessage 检查 Raft 消息外层字段是否合法。
+// 返回 false 表示消息无效，可以直接忽略。
 func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	regionID := msg.GetRegionId()
 	from := msg.GetFromPeer()
@@ -223,9 +242,8 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// checkMessage 检查消息是否发给了正确 peer，并过滤过期消息。
+// 返回 true 表示消息可以静默丢弃；必要时会给过期 peer 发送 tombstone 消息。
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
@@ -270,6 +288,7 @@ func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	return false
 }
 
+// handleStaleMsg 在发送方已经过期时，按需回发 tombstone 消息让它清理自己。
 func handleStaleMsg(trans Transport, msg *rspb.RaftMessage, curEpoch *metapb.RegionEpoch,
 	needGC bool) {
 	regionID := msg.RegionId
@@ -294,6 +313,8 @@ func handleStaleMsg(trans Transport, msg *rspb.RaftMessage, curEpoch *metapb.Reg
 	}
 }
 
+// handleGCPeerMsg 处理 tombstone Raft 消息。
+// 如果当前 peer 的 Region 元信息已经足够旧，就销毁本地 peer。
 func (d *peerMsgHandler) handleGCPeerMsg(msg *rspb.RaftMessage) {
 	fromEpoch := msg.RegionEpoch
 	if !util.IsEpochStale(d.Region().RegionEpoch, fromEpoch) {
@@ -309,8 +330,8 @@ func (d *peerMsgHandler) handleGCPeerMsg(msg *rspb.RaftMessage) {
 	}
 }
 
-// Returns `None` if the `msg` doesn't contain a snapshot or it contains a snapshot which
-// doesn't conflict with any other snapshots or regions. Otherwise a `snap.SnapKey` is returned.
+// checkSnapshot 在接受快照消息前检查快照归属和 Region 重叠情况。
+// 如果快照可以继续处理，返回 nil；如果应该丢弃快照文件，返回对应 snap key。
 func (d *peerMsgHandler) checkSnapshot(msg *rspb.RaftMessage) (*snap.SnapKey, error) {
 	if msg.Message.Snapshot == nil {
 		return nil, nil
@@ -365,6 +386,7 @@ func (d *peerMsgHandler) checkSnapshot(msg *rspb.RaftMessage) (*snap.SnapKey, er
 	return nil, nil
 }
 
+// destroyPeer 从本地元信息中删除当前 peer，并关闭它的 router 入口。
 func (d *peerMsgHandler) destroyPeer() {
 	log.Infof("%s starts destroy", d.Tag)
 	regionID := d.regionId
@@ -391,6 +413,8 @@ func (d *peerMsgHandler) destroyPeer() {
 	delete(meta.regions, regionID)
 }
 
+// findSiblingRegion 返回一个相邻 Region。
+// 当客户端 Region epoch 过期时，可以借它刷新 split 后的 Region 信息。
 func (d *peerMsgHandler) findSiblingRegion() (result *metapb.Region) {
 	meta := d.ctx.storeMeta
 	meta.RLock()
@@ -403,6 +427,7 @@ func (d *peerMsgHandler) findSiblingRegion() (result *metapb.Region) {
 	return
 }
 
+// onRaftGCLogTick 在已 apply 日志超过阈值时，propose 一个 CompactLog admin command。
 func (d *peerMsgHandler) onRaftGCLogTick() {
 	d.ticker.schedule(PeerTickRaftLogGC)
 	if !d.IsLeader() {
@@ -437,6 +462,7 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 	d.proposeRaftCommand(request, nil)
 }
 
+// onSplitRegionCheckTick 为过大的 leader Region 调度 split-check worker 任务。
 func (d *peerMsgHandler) onSplitRegionCheckTick() {
 	d.ticker.schedule(PeerTickSplitRegionCheck)
 	// To avoid frequent scan, we only add new scan tasks if all previous tasks
@@ -457,6 +483,7 @@ func (d *peerMsgHandler) onSplitRegionCheckTick() {
 	d.SizeDiffHint = 0
 }
 
+// onPrepareSplitRegion 在验证 split 请求仍然匹配当前 Region 后，向 scheduler 申请 split id。
 func (d *peerMsgHandler) onPrepareSplitRegion(regionEpoch *metapb.RegionEpoch, splitKey []byte, cb *message.Callback) {
 	if err := d.validateSplitRegion(regionEpoch, splitKey); err != nil {
 		cb.Done(ErrResp(err))
@@ -471,6 +498,7 @@ func (d *peerMsgHandler) onPrepareSplitRegion(regionEpoch *metapb.RegionEpoch, s
 	}
 }
 
+// validateSplitRegion 在请求 scheduler split 前，检查 leader 身份、split key 和 Region epoch。
 func (d *peerMsgHandler) validateSplitRegion(epoch *metapb.RegionEpoch, splitKey []byte) error {
 	if len(splitKey) == 0 {
 		err := errors.Errorf("%s split key should not be empty", d.Tag)
@@ -504,10 +532,12 @@ func (d *peerMsgHandler) validateSplitRegion(epoch *metapb.RegionEpoch, splitKey
 	return nil
 }
 
+// onApproximateRegionSize 记录 split-check worker 上报的最新 Region 近似大小。
 func (d *peerMsgHandler) onApproximateRegionSize(size uint64) {
 	d.ApproximateSize = &size
 }
 
+// onSchedulerHeartbeatTick 把 leader Region 的状态上报给 scheduler。
 func (d *peerMsgHandler) onSchedulerHeartbeatTick() {
 	d.ticker.schedule(PeerTickSchedulerHeartbeat)
 
@@ -517,6 +547,7 @@ func (d *peerMsgHandler) onSchedulerHeartbeatTick() {
 	d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 }
 
+// onGCSnap 删除过期、已 compact 或已经 apply 完的 snapshot 文件。
 func (d *peerMsgHandler) onGCSnap(snaps []snap.SnapKeyWithSending) {
 	compactedIdx := d.peerStorage.truncatedIndex()
 	compactedTerm := d.peerStorage.truncatedTerm()
@@ -551,6 +582,7 @@ func (d *peerMsgHandler) onGCSnap(snaps []snap.SnapKeyWithSending) {
 	}
 }
 
+// newAdminRequest 创建 admin command 共用的请求外壳。
 func newAdminRequest(regionID uint64, peer *metapb.Peer) *raft_cmdpb.RaftCmdRequest {
 	return &raft_cmdpb.RaftCmdRequest{
 		Header: &raft_cmdpb.RaftRequestHeader{
@@ -560,6 +592,8 @@ func newAdminRequest(regionID uint64, peer *metapb.Peer) *raft_cmdpb.RaftCmdRequ
 	}
 }
 
+// newCompactLogRequest 构造 CompactLog admin command。
+// apply 线程后续会根据其中的 index/term compact Raft 日志。
 func newCompactLogRequest(regionID uint64, peer *metapb.Peer, compactIndex, compactTerm uint64) *raft_cmdpb.RaftCmdRequest {
 	req := newAdminRequest(regionID, peer)
 	req.AdminRequest = &raft_cmdpb.AdminRequest{
