@@ -158,6 +158,38 @@ Lab2A 可以按三个文件层次拆：
 
 学习顺序建议也是这个顺序：先让集群能选主，再让 leader 能复制日志，最后把 Raft 模块暴露给上层应用。
 
+### 2AC：`rawnode.go` 每个函数负责什么
+
+`rawnode.go` 是 Raft 模块暴露给上层的接口层。它不负责真正写磁盘、发网络、执行 KV；它负责把底层 `Raft` 的内部变化整理成 `Ready`，让上层按顺序处理。
+
+| 名称 | 作用 |
+|---|---|
+| `SoftState` | 表示不用持久化的易失状态，比如当前 leader 和当前节点角色。 |
+| `Ready` 结构体 | 表示上层现在必须处理的一批输出：待持久化日志、HardState、快照、待发送消息、已提交日志。 |
+| `RawNode` | 包住底层 `Raft`，给上层提供 `Tick`、`Step`、`Ready`、`Advance` 这种更稳定的接口。 |
+| `NewRawNode` | 创建 `RawNode` 和内部 `Raft`，并记录初始状态，后面用来判断状态是否发生变化。 |
+| `Tick` | 推进一次逻辑时钟，用于触发选举超时和 leader 心跳。 |
+| `Campaign` | 主动发起选举，本质是向 Raft 注入本地 `MsgHup`。 |
+| `Propose` | 提议一条普通业务日志，把上层数据包装成 `EntryNormal` 交给 leader 复制。 |
+| `ProposeConfChange` | 提议一条成员变更日志；这里只是写入日志，不会立刻改变成员。 |
+| `ApplyConfChange` | 在成员变更日志提交后，真正把节点加入或移出 Raft peer 集合。 |
+| `Step` | 处理外部传进来的 Raft 消息，同时拒绝不该从网络进入的本地消息。 |
+| `Ready()` | 生成当前这一批要交给上层处理的 raft 输出。 |
+| `HasReady` | 判断现在有没有必要调用 `Ready`，避免上层空转。 |
+| `Advance` | 上层处理完上一批 `Ready` 后调用，用来推进 `stabled`、`applied` 等内部游标。 |
+| `GetProgress` | leader 用来查看每个 peer 的日志复制进度。 |
+| `TransferLeader` | 请求把 leader 身份转移给指定节点，是否成功取决于目标节点是否追上日志。 |
+
+最关键的是 `Ready -> 上层处理 -> Advance` 这个循环：
+
+```text
+Raft 产生变化
+  -> HasReady 返回 true
+  -> Ready 拿到待处理内容
+  -> 上层持久化日志/发送消息/apply committed entries
+  -> Advance 告诉 RawNode：这一批已经处理完了
+```
+
 ## B 部分：把 KV 请求放进 Raft
 
 Lab1 里 `RawPut` 是直接写 Badger。Lab2 不能这么做。

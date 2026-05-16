@@ -111,7 +111,7 @@ func (l *RaftLog) allEntries() []pb.Entry {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	if l.stabled >= l.LastIndex() {
-		return nil
+		return []pb.Entry{}
 	}
 	offset := l.entries[0].Index
 	return l.entries[l.stabled-offset+1:]
@@ -146,4 +146,37 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	}
 
 	return l.entries[i-offset].Term, nil
+}
+
+func (l *RaftLog) appendEntries(ents []*pb.Entry) {
+	if len(ents) == 0 {
+		return
+	}
+
+	offset := l.entries[0].Index
+
+	for i, ent := range ents {
+		if ent.Index <= l.LastIndex() {
+			localTerm, err := l.Term(ent.Index)
+			if err == nil && localTerm == ent.Term {
+				continue
+			}
+
+			l.entries = l.entries[:ent.Index-offset]
+
+			if l.stabled >= ent.Index {
+				l.stabled = ent.Index - 1
+			}
+
+			for _, newEnt := range ents[i:] {
+				l.entries = append(l.entries, *newEnt)
+			}
+			return
+		}
+
+		for _, newEnt := range ents[i:] {
+			l.entries = append(l.entries, *newEnt)
+		}
+		return
+	}
 }

@@ -363,6 +363,37 @@ func (r *Raft) becomeLeader() {
 	r.Prs[r.id].Next = entry.Index + 1
 }
 
+func (r *Raft) maybeCommit() bool {
+	oldCommitted := r.RaftLog.committed
+
+	for index := r.RaftLog.LastIndex(); index > r.RaftLog.committed; index-- {
+		term, err := r.RaftLog.Term(index)
+		if err != nil {
+			continue
+		}
+
+		// Raft 规定：leader 只能通过多数派直接提交当前 term 的日志。
+		// 一旦当前 term 的某条日志提交，它前面的旧 term 日志也自然一起提交。
+		if term != r.Term {
+			continue
+		}
+
+		count := 0
+		for _, pr := range r.Prs {
+			if pr.Match >= index {
+				count++
+			}
+		}
+
+		if count >= r.quorum() {
+			r.RaftLog.committed = index
+			break
+		}
+	}
+
+	return r.RaftLog.committed != oldCommitted
+}
+
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
@@ -371,6 +402,8 @@ func (r *Raft) Step(m pb.Message) error {
 		r.becomeFollower(m.Term, None)
 	}
 	switch m.MsgType {
+	// MsgBeat 是 leader 本地的定时消息。
+	// 它不是网络消息，作用是提醒 leader 给所有 follower 发心跳。
 	case pb.MessageType_MsgBeat:
 		if r.State == StateLeader {
 			for id := range r.Prs {
@@ -382,6 +415,8 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 		return nil
 
+	// MsgHup 是本地选举触发消息。
+	// follower/candidate 选举超时后，会用它让自己发起新一轮选举。
 	case pb.MessageType_MsgHup:
 		if r.State == StateLeader {
 			return nil
@@ -414,6 +449,8 @@ func (r *Raft) Step(m pb.Message) error {
 			})
 		}
 		return nil
+	// MsgRequestVote 是 candidate 发给其他节点的投票请求。
+	// 接收方要判断：任期是否够新、自己是否还能投票、candidate 日志是否足够新。
 	case pb.MessageType_MsgRequestVote:
 		granted := false
 		if m.Term >= r.Term {
@@ -436,6 +473,8 @@ func (r *Raft) Step(m pb.Message) error {
 
 		r.msgs = append(r.msgs, resp)
 		return nil
+	// MsgRequestVoteResponse 是其他节点对 candidate 的投票响应。
+	// candidate 收到多数同意后成为 leader；收到多数拒绝后退回 follower。
 	case pb.MessageType_MsgRequestVoteResponse:
 		if r.State != StateCandidate {
 			return nil
@@ -465,14 +504,104 @@ func (r *Raft) Step(m pb.Message) error {
 			r.becomeFollower(r.Term, None)
 		}
 		return nil
+	// MsgHeartbeat 是 leader 发给 follower 的心跳。
+	// follower 用它确认当前 leader，并同步 leader 已经提交到哪里的 commit index。
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 		return nil
+	// MsgAppend 是 leader 发给 follower 的日志复制请求。
+	// 里面可能带新日志，也可能只是用 prevLogIndex/prevLogTerm 做一致性检查。
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 		return nil
+	// MsgPropose 是上层应用提交给 leader 的新日志提案。
+	// leader 负责给 entry 填 Term/Index，追加到本地日志，再发 MsgAppend 给 followers。
+	case pb.MessageType_MsgPropose:
+		if r.State != StateLeader {
+			return ErrProposalDropped
+		}
+
+		if len(m.Entries) == 0 {
+			return nil
+		}
+
+		lastIndex := r.RaftLog.LastIndex()
+
+		for _, e := range m.Entries {
+			lastIndex++
+
+			ent := *e
+			ent.Term = r.Term
+			ent.Index = lastIndex
+
+			r.RaftLog.entries = append(r.RaftLog.entries, ent)
+		}
+
+		r.Prs[r.id].Match = lastIndex
+		r.Prs[r.id].Next = lastIndex + 1
+
+		if len(r.Prs) == 1 {
+			r.RaftLog.committed = lastIndex
+			return nil
+		}
+
+		for id := range r.Prs {
+			if id == r.id {
+				continue
+			}
+			r.sendAppend(id)
+		}
+
+		return nil
+	// MsgAppendResponse 是 follower 对 MsgAppend 的响应。
+	// leader 用它更新 follower 的复制进度，并尝试推进 committed。
+	case pb.MessageType_MsgAppendResponse:
+		if r.State != StateLeader {
+			return nil
+		}
+
+		pr, ok := r.Prs[m.From]
+		if !ok {
+			return nil
+		}
+
+		if m.Reject {
+			if pr.Next > 1 {
+				pr.Next--
+			}
+			r.sendAppend(m.From)
+			return nil
+		}
+
+		if m.Index > pr.Match {
+			pr.Match = m.Index
+		}
+		pr.Next = pr.Match + 1
+
+		if r.maybeCommit() {
+			for id := range r.Prs {
+				if id == r.id {
+					continue
+				}
+				r.sendAppend(id)
+			}
+		}
+
+		return nil
+	// MsgHeartbeatResponse 是 follower 对 heartbeat 的响应。
+	// leader 收到后尝试发 MsgAppend，用来给落后的 follower 补日志。
+	case pb.MessageType_MsgHeartbeatResponse:
+		if r.State != StateLeader {
+			return nil
+		}
+		r.sendAppend(m.From)
+		return nil
+
 	}
 
+	// 下面这些消息后续阶段会补：
+	// MsgSnapshot：leader 发给落后 follower 的快照安装请求。（2C）
+	// MsgTransferLeader / MsgTimeoutNow：leader transfer 相关消息。（3A）
 	switch r.State {
 	case StateFollower:
 	case StateCandidate:
@@ -512,28 +641,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 
 	lastNewIndex := m.Index + uint64(len(m.Entries))
-
-	for i, ent := range m.Entries {
-		if ent.Index <= r.RaftLog.LastIndex() {
-			localTerm, err := r.RaftLog.Term(ent.Index)
-			if err != nil || localTerm != ent.Term {
-				offset := r.RaftLog.entries[0].Index
-				r.RaftLog.entries = r.RaftLog.entries[:ent.Index-offset]
-				for _, newEnt := range m.Entries[i:] {
-					r.RaftLog.entries = append(r.RaftLog.entries, *newEnt)
-				}
-				break
-			}
-		} else {
-			for _, newEnt := range m.Entries[i:] {
-				r.RaftLog.entries = append(r.RaftLog.entries, *newEnt)
-			}
-			break
-		}
-	}
+	r.RaftLog.appendEntries(m.Entries)
 
 	if m.Commit > r.RaftLog.committed {
-		r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
+		r.RaftLog.committed = min(m.Commit, lastNewIndex)
 	}
 
 	r.msgs = append(r.msgs, pb.Message{
@@ -560,10 +671,6 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	}
 
 	r.becomeFollower(m.Term, m.From)
-
-	if m.Commit > r.RaftLog.committed {
-		r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
-	}
 
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
