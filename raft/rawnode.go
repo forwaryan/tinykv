@@ -75,6 +75,30 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	prevSoftSt *SoftState
+	prevHardSt pb.HardState
+}
+
+func (rn *RawNode) softState() *SoftState {
+	return &SoftState{
+		Lead:      rn.Raft.Lead,
+		RaftState: rn.Raft.State,
+	}
+}
+
+func (rn *RawNode) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   rn.Raft.Term,
+		Vote:   rn.Raft.Vote,
+		Commit: rn.Raft.RaftLog.committed,
+	}
+}
+
+func isSoftStateEqual(a, b *SoftState) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Lead == b.Lead && a.RaftState == b.RaftState
 }
 
 // NewRawNode 根据配置创建 RawNode。
@@ -82,7 +106,12 @@ type RawNode struct {
 // 这样 HasReady 后续才能判断状态是否发生变化。
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	rn := &RawNode{
+		Raft: newRaft(config),
+	}
+	rn.prevSoftSt = rn.softState()
+	rn.prevHardSt = rn.hardState()
+	return rn, nil
 }
 
 // Tick 推进一次 Raft 逻辑时钟。
@@ -157,14 +186,57 @@ func (rn *RawNode) Step(m pb.Message) error {
 // 它会收集 unstable entries、committed entries、待发送消息、快照以及 soft/hard state 变化。
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+
+	rd := Ready{}
+
+	softState := rn.softState()
+	if !isSoftStateEqual(softState, rn.prevSoftSt) {
+		rd.SoftState = softState
+	}
+
+	hardState := rn.hardState()
+	if !isHardStateEqual(hardState, rn.prevHardSt) {
+		rd.HardState = hardState
+	}
+
+	rd.Entries = rn.Raft.RaftLog.unstableEntries()
+	rd.CommittedEntries = rn.Raft.RaftLog.nextEnts()
+	if len(rn.Raft.msgs) > 0 {
+		rd.Messages = rn.Raft.msgs
+	}
+
+	if rn.Raft.RaftLog.pendingSnapshot != nil && !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
+
+	return rd
 }
 
 // HasReady 用来快速判断当前是否存在待处理的 Ready。
 // 如果有状态变化、未持久化日志、快照、已提交未应用日志或待发送消息，就应该返回 true。
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
-	return false
+	if !isSoftStateEqual(rn.softState(), rn.prevSoftSt) {
+		return true
+	}
+
+	if !isHardStateEqual(rn.hardState(), rn.prevHardSt) {
+		return true
+	}
+
+	if len(rn.Raft.RaftLog.unstableEntries()) > 0 {
+		return true
+	}
+
+	if len(rn.Raft.RaftLog.nextEnts()) > 0 {
+		return true
+	}
+
+	if rn.Raft.RaftLog.pendingSnapshot != nil && !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		return true
+	}
+
+	return len(rn.Raft.msgs) > 0
 }
 
 // Advance 通知 RawNode：上一批 Ready 已经被上层处理完。
@@ -172,6 +244,19 @@ func (rn *RawNode) HasReady() bool {
 // 推进 stabled/applied 等内部进度，为下一批 Ready 做准备。
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	if len(rd.Entries) > 0 {
+		lastEntry := rd.Entries[len(rd.Entries)-1]
+		rn.Raft.RaftLog.stabled = lastEntry.Index
+	}
+
+	if len(rd.CommittedEntries) > 0 {
+		lastEntry := rd.CommittedEntries[len(rd.CommittedEntries)-1]
+		rn.Raft.RaftLog.applied = lastEntry.Index
+	}
+
+	rn.Raft.msgs = nil
+	rn.prevSoftSt = rn.softState()
+	rn.prevHardSt = rn.hardState()
 }
 
 // GetProgress 在当前节点是 leader 时返回所有 peer 的复制进度。

@@ -367,9 +367,7 @@ func (r *Raft) becomeLeader() {
 			Next:  lastIndex + 1,
 		}
 	}
-	// r.Prs[r.id].Match = lastIndex
-	// r.Prs[r.id].Next = lastIndex + 1
-
+	// leader 上任后追加一条 no-op，用来提交当前任期。
 	entry := pb.Entry{
 		EntryType: pb.EntryType_EntryNormal,
 		Term:      r.Term,
@@ -378,6 +376,8 @@ func (r *Raft) becomeLeader() {
 	r.RaftLog.entries = append(r.RaftLog.entries, entry)
 	r.Prs[r.id].Match = entry.Index
 	r.Prs[r.id].Next = entry.Index + 1
+	r.maybeCommit()
+
 }
 
 // maybeCommit 尝试推进 leader 的 committed index。
