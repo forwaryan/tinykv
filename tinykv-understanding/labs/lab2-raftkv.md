@@ -158,6 +158,122 @@ Lab2A 可以按三个文件层次拆：
 
 学习顺序建议也是这个顺序：先让集群能选主，再让 leader 能复制日志，最后把 Raft 模块暴露给上层应用。
 
+### 2AA：选主、投票、心跳在做什么
+
+2AA 的目标是先让 Raft 集群有一个稳定的 leader。这个阶段还不重点处理业务日志复制，而是先把 Raft 的角色转换、投票、心跳跑通。
+
+核心文件是 `raft/raft.go`。
+
+| 函数或消息 | 作用 |
+|---|---|
+| `newRaft` | 根据 `Config` 和底层 `Storage` 创建 Raft 节点，恢复 term、vote、commit、peer 列表和日志状态。 |
+| `tick` | 推进逻辑时钟。follower/candidate 超时后触发选举，leader 到心跳间隔后触发心跳。 |
+| `becomeFollower` | 把当前节点切成 follower，记录当前 term 和 leader，并清空投票过程中的临时状态。 |
+| `becomeCandidate` | 把当前节点切成 candidate，term 加一，先给自己投票，然后向其他节点请求投票。 |
+| `becomeLeader` | 把当前节点切成 leader，初始化每个 peer 的复制进度，并追加一条空日志。 |
+| `MsgHup` | 本地选举触发消息，一般由 election timeout 产生。 |
+| `MsgBeat` | leader 本地心跳触发消息，一般由 heartbeat timeout 产生。 |
+| `MsgRequestVote` | candidate 发给其他节点的投票请求。 |
+| `MsgRequestVoteResponse` | follower 对投票请求的回复，candidate 根据多数票决定是否成为 leader。 |
+| `MsgHeartbeat` | leader 发给 follower 的心跳，用来维持 leader 身份，并携带当前 commit 进度。 |
+| `MsgHeartbeatResponse` | follower 对心跳的回复，后面的 2AB 会用它帮助 leader 发现落后节点并补日志。 |
+
+2AA 的主线可以这样看：
+
+```text
+follower 的 electionElapsed 不断增加
+  -> 超过 randomizedElectionTimeout
+  -> tick 注入 MsgHup
+  -> Step 处理 MsgHup
+  -> becomeCandidate
+  -> 给自己投票，向其他 peer 发送 MsgRequestVote
+  -> 收到多数 MsgRequestVoteResponse
+  -> becomeLeader
+  -> 追加 leader noop entry
+  -> 后续定期通过 MsgBeat 发送 MsgHeartbeat
+```
+
+这里最容易困惑的是 leader 刚当选后追加的空日志，也就是 noop entry。它没有业务数据，但很重要：
+
+```text
+leader 当选
+  -> 追加当前 term 的空日志
+  -> 复制给多数节点
+  -> 这能帮助 leader 安全地推进当前 term 的 commit
+```
+
+原因是 Raft 里 leader 不能只靠旧 term 的日志来确认自己当前 term 的领导权。当前 term 的一条日志被多数派接受后，leader 才能更安全地推进提交位置。
+
+### 2AB：日志复制、冲突处理、commit 在做什么
+
+2AB 的目标是让 leader 不只是能当选，还能把上层提交的日志复制到 follower，并在多数派确认后推进 commit。
+
+核心文件是 `raft/log.go` 和 `raft/raft.go`。
+
+| 函数或消息 | 作用 |
+|---|---|
+| `RaftLog.LastIndex` | 返回当前日志最后一条 entry 的 index。leader 给新日志分配 index 时会用到。 |
+| `RaftLog.Term` | 查询某个 index 对应的 term，用来做日志匹配和冲突检测。 |
+| `RaftLog.appendEntries` | 把新日志追加到本地。如果发现同 index 但 term 不同，就从冲突点截断后重写。 |
+| `RaftLog.unstableEntries` | 找出还没有持久化到 storage 的日志，2AC 的 `Ready` 会把它们交给上层保存。 |
+| `RaftLog.nextEnts` | 找出已经 committed 但还没有 applied 的日志，2AC 的 `Ready` 会把它们交给上层 apply。 |
+| `sendAppend` | leader 给指定 follower 发送 `MsgAppend`，里面包含 prev log 信息和要复制的新 entries。 |
+| `handleAppendEntries` | follower 处理 leader 发来的 `MsgAppend`，先检查 prev log 是否匹配，再追加 entries。 |
+| `maybeCommit` | leader 根据各 peer 的 `Match` 进度判断是否有日志被多数派复制，然后推进 committed。 |
+| `MsgPropose` | 上层提交给 leader 的新日志提案，leader 会给 entry 填 term/index 并追加到本地日志。 |
+| `MsgAppend` | leader 发给 follower 的日志复制请求，也就是 Raft 论文里的 AppendEntries。 |
+| `MsgAppendResponse` | follower 对日志复制的回复，leader 用它更新该 follower 的 `Progress`。 |
+
+2AB 的正常日志复制主线是：
+
+```text
+上层向 leader 提交 MsgPropose
+  -> leader 给 entry 填当前 term 和下一个 index
+  -> leader append 到自己的 RaftLog
+  -> leader 更新自己的 Progress
+  -> leader 给每个 follower 发送 MsgAppend
+  -> follower 检查 prev log index/term 是否匹配
+  -> 匹配则 appendEntries，并回复成功
+  -> leader 收到 MsgAppendResponse
+  -> 更新 follower 的 Match/Next
+  -> maybeCommit 检查是否达到多数派
+  -> committed 前进
+  -> leader 再发 MsgAppend/heartbeat 告诉 followers 新 commit
+```
+
+这里的关键是 `Progress`：
+
+| 字段 | 含义 |
+|---|---|
+| `Match` | leader 认为这个 peer 已经复制成功的最高日志 index。 |
+| `Next` | leader 下一次准备发给这个 peer 的日志起点。 |
+
+成功复制时：
+
+```text
+follower 回复成功，并带上复制到的 index
+  -> leader 把 Progress.Match 推到这个 index
+  -> Progress.Next 变成 Match + 1
+```
+
+复制失败时：
+
+```text
+follower 回复失败
+  -> 说明 prev log 对不上
+  -> leader 把 Progress.Next 往回退
+  -> 下次 sendAppend 从更早的位置重新尝试
+```
+
+所以 2AB 的核心不是简单地 append。它真正解决的是这几个问题：
+
+```text
+新日志怎么从 leader 复制到 follower
+follower 日志和 leader 不一致时怎么修正
+leader 怎么知道哪些日志被多数派接受
+commit index 怎么安全推进
+```
+
 ### 2AC：`rawnode.go` 每个函数负责什么
 
 `rawnode.go` 是 Raft 模块暴露给上层的接口层。它不负责真正写磁盘、发网络、执行 KV；它负责把底层 `Raft` 的内部变化整理成 `Ready`，让上层按顺序处理。
