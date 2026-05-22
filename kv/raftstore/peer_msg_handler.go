@@ -4,12 +4,16 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Connor1996/badger"
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -47,7 +51,140 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
-	// Your Code Here (2B).
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+
+	rd := d.RaftGroup.Ready()
+
+	if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
+		panic(err)
+	}
+
+	d.Send(d.ctx.trans, rd.Messages)
+
+	for _, entry := range rd.CommittedEntries {
+		d.applyEntry(entry)
+	}
+
+	d.RaftGroup.Advance(rd)
+}
+
+func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry) {
+	if entry.EntryType != eraftpb.EntryType_EntryNormal {
+		return
+	}
+
+	cb := d.findProposal(entry.Index, entry.Term)
+
+	if len(entry.Data) == 0 {
+		kvWB := new(engine_util.WriteBatch)
+		d.peerStorage.applyState.AppliedIndex = entry.Index
+		if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+			panic(err)
+		}
+		if err := kvWB.WriteToDB(d.ctx.engine.Kv); err != nil {
+			panic(err)
+		}
+		if cb != nil {
+			cb.Done(newCmdResp())
+		}
+		return
+	}
+
+	req := new(raft_cmdpb.RaftCmdRequest)
+	if err := req.Unmarshal(entry.Data); err != nil {
+		panic(err)
+	}
+
+	resp := newCmdResp()
+	kvWB := new(engine_util.WriteBatch)
+
+	for _, request := range req.GetRequests() {
+		cmdResp := &raft_cmdpb.Response{
+			CmdType: request.CmdType,
+		}
+
+		switch request.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			get := request.GetGet()
+			if err := util.CheckKeyInRegion(get.Key, d.Region()); err != nil {
+				BindRespError(resp, err)
+				break
+			}
+			value, err := engine_util.GetCF(d.ctx.engine.Kv, get.Cf, get.Key)
+			if err != nil && err != badger.ErrKeyNotFound {
+				BindRespError(resp, err)
+				break
+			}
+			cmdResp.Get = &raft_cmdpb.GetResponse{Value: value}
+
+		case raft_cmdpb.CmdType_Put:
+			put := request.GetPut()
+			if err := util.CheckKeyInRegion(put.Key, d.Region()); err != nil {
+				BindRespError(resp, err)
+				break
+			}
+			kvWB.SetCF(put.Cf, put.Key, put.Value)
+			cmdResp.Put = &raft_cmdpb.PutResponse{}
+
+		case raft_cmdpb.CmdType_Delete:
+			del := request.GetDelete()
+			if err := util.CheckKeyInRegion(del.Key, d.Region()); err != nil {
+				BindRespError(resp, err)
+				break
+			}
+			kvWB.DeleteCF(del.Cf, del.Key)
+			cmdResp.Delete = &raft_cmdpb.DeleteResponse{}
+
+		case raft_cmdpb.CmdType_Snap:
+			cmdResp.Snap = &raft_cmdpb.SnapResponse{
+				Region: d.Region(),
+			}
+			if cb != nil {
+				cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
+			}
+		}
+
+		resp.Responses = append(resp.Responses, cmdResp)
+	}
+
+	d.peerStorage.applyState.AppliedIndex = entry.Index
+
+	if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+		panic(err)
+	}
+	if err := kvWB.WriteToDB(d.ctx.engine.Kv); err != nil {
+		panic(err)
+	}
+
+	if cb != nil {
+		cb.Done(resp)
+	}
+}
+
+func (d *peerMsgHandler) findProposal(index uint64, term uint64) *message.Callback {
+	var cb *message.Callback
+
+	for len(d.proposals) > 0 {
+		p := d.proposals[0]
+
+		if p.index == index && p.term == term {
+			cb = p.cb
+			d.proposals = d.proposals[1:]
+			break
+		}
+
+		if p.index < index || (p.index == index && p.term != term) {
+			NotifyStaleReq(term, p.cb)
+			d.proposals = d.proposals[1:]
+			continue
+		}
+
+		break
+	}
+
+	return cb
 }
 
 // HandleMsg 根据消息类型分发到对应的 peer 处理逻辑。
@@ -125,7 +262,25 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
-	// Your Code Here (2B).
+	data, err := msg.Marshal()
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	index := d.nextProposalIndex()
+	term := d.Term()
+
+	if err := d.RaftGroup.Propose(data); err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	d.proposals = append(d.proposals, &proposal{
+		index: index,
+		term:  term,
+		cb:    cb,
+	})
 }
 
 // onTick 推进 peer 级别的周期任务，并重新安排下一轮 tick。

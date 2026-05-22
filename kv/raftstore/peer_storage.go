@@ -327,7 +327,38 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // Append 把给定 entries 写入 raft log，并更新 ps.raftState。
 // Lab2B 会在这里持久化 Ready.Entries，并删除被 Raft 覆盖的旧冲突后缀。
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+
+	firstIndex := entries[0].Index
+	lastIndex := entries[len(entries)-1].Index
+
+	if lastIndex <= ps.truncatedIndex() {
+		return nil
+	}
+
+	if firstIndex <= ps.truncatedIndex() {
+		entries = entries[ps.truncatedIndex()+1-firstIndex:]
+	}
+
+	oldLastIndex := ps.raftState.LastIndex
+	lastEntry := entries[len(entries)-1]
+
+	for _, entry := range entries {
+		ent := entry
+		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.GetId(), ent.Index), &ent); err != nil {
+			return err
+		}
+	}
+
+	ps.raftState.LastIndex = lastEntry.Index
+	ps.raftState.LastTerm = lastEntry.Term
+
+	for index := lastEntry.Index + 1; index <= oldLastIndex; index++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.GetId(), index))
+	}
+
 	return nil
 }
 
@@ -352,8 +383,39 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 // Lab2B/2C 会在这里先保存 HardState、entries 和 snapshot，再允许发送消息。
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// Your Code Here (2B/2C).
-	return nil, nil
+	kvWB := new(engine_util.WriteBatch)
+	raftWB := new(engine_util.WriteBatch)
+
+	var applySnapResult *ApplySnapResult
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		result, err := ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
+		applySnapResult = result
+	}
+
+	if err := ps.Append(ready.Entries, raftWB); err != nil {
+		return nil, err
+	}
+
+	if !raft.IsEmptyHardState(ready.HardState) {
+		hardState := ready.HardState
+		ps.raftState.HardState = &hardState
+	}
+
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState); err != nil {
+		return nil, err
+	}
+
+	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+		return nil, err
+	}
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
+
+	return applySnapResult, nil
 }
 
 // ClearData 删除当前 peer 对应 Region 的 KV 数据范围。
