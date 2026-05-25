@@ -57,8 +57,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 	rd := d.RaftGroup.Ready()
 
-	if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
+	applySnapResult, err := d.peerStorage.SaveReadyState(&rd)
+	if err != nil {
 		panic(err)
+	}
+	if applySnapResult != nil {
+		d.applySnapshotResult(applySnapResult)
 	}
 
 	d.Send(d.ctx.trans, rd.Messages)
@@ -70,25 +74,36 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	d.RaftGroup.Advance(rd)
 }
 
+func (d *peerMsgHandler) applySnapshotResult(result *ApplySnapResult) {
+	if result == nil {
+		return
+	}
+
+	d.peerStorage.SetRegion(result.Region)
+
+	d.ctx.storeMeta.Lock()
+	defer d.ctx.storeMeta.Unlock()
+
+	if result.PrevRegion != nil {
+		d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: result.PrevRegion})
+	}
+
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: result.Region})
+	d.ctx.storeMeta.regions[result.Region.GetId()] = result.Region
+}
+
+// applyEntry 执行一条已经被 Raft commit 的日志。
+// Raft 只保证所有 peer 看到同一条日志；真正修改 KV、元信息并回调客户端是在这里发生。
 func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry) {
 	if entry.EntryType != eraftpb.EntryType_EntryNormal {
 		return
 	}
 
+	// 只有本 peer 自己 propose 的日志才会有 callback；从 leader 复制来的日志也要照常 apply。
 	cb := d.findProposal(entry.Index, entry.Term)
 
 	if len(entry.Data) == 0 {
-		kvWB := new(engine_util.WriteBatch)
-		d.peerStorage.applyState.AppliedIndex = entry.Index
-		if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
-			panic(err)
-		}
-		if err := kvWB.WriteToDB(d.ctx.engine.Kv); err != nil {
-			panic(err)
-		}
-		if cb != nil {
-			cb.Done(newCmdResp())
-		}
+		d.applyEmptyEntry(entry, cb)
 		return
 	}
 
@@ -97,6 +112,85 @@ func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry) {
 		panic(err)
 	}
 
+	if req.GetAdminRequest() != nil {
+		d.applyAdminRequest(entry, req, cb)
+		return
+	}
+
+	d.applyNormalRequests(entry, req, cb)
+}
+
+// persistApplyState 记录状态机已经 apply 到哪个 Raft log index。
+// 这条元信息必须和本次 KV/元信息修改一起落盘，重启后才能避免重复 apply 或漏 apply。
+func (d *peerMsgHandler) persistApplyState(kvWB *engine_util.WriteBatch, index uint64) {
+	d.peerStorage.applyState.AppliedIndex = index
+
+	if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+		panic(err)
+	}
+	if err := kvWB.WriteToDB(d.ctx.engine.Kv); err != nil {
+		panic(err)
+	}
+}
+
+// applyEmptyEntry 处理 leader noop 日志。
+// 空日志不改用户数据，但仍然是 committed entry，所以必须推进 AppliedIndex。
+func (d *peerMsgHandler) applyEmptyEntry(entry eraftpb.Entry, cb *message.Callback) {
+	kvWB := new(engine_util.WriteBatch)
+	d.persistApplyState(kvWB, entry.Index)
+
+	if cb != nil {
+		cb.Done(newCmdResp())
+	}
+}
+
+// applyAdminRequest 处理 raftstore 管理命令。
+// 这类命令修改 Region/Raft 元信息；当前 Lab2C 先实现 CompactLog。
+func (d *peerMsgHandler) applyAdminRequest(entry eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	resp := newCmdResp()
+	kvWB := new(engine_util.WriteBatch)
+
+	adminReq := req.GetAdminRequest()
+	var compactIndex uint64
+
+	switch adminReq.GetCmdType() {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		compactLog := adminReq.GetCompactLog()
+		truncatedState := d.peerStorage.applyState.TruncatedState
+		if truncatedState == nil {
+			truncatedState = &rspb.RaftTruncatedState{}
+			d.peerStorage.applyState.TruncatedState = truncatedState
+		}
+
+		// TruncatedState 是持久化的 compact 边界；它推进后，PeerStorage.FirstIndex/Term
+		// 才会认为 compactIndex 之前的 raft log 已经不可读。
+		if compactLog.GetCompactIndex() > truncatedState.GetIndex() {
+			truncatedState.Index = compactLog.GetCompactIndex()
+			truncatedState.Term = compactLog.GetCompactTerm()
+			compactIndex = compactLog.GetCompactIndex()
+		}
+
+		resp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+			CompactLog: &raft_cmdpb.CompactLogResponse{},
+		}
+	}
+
+	d.persistApplyState(kvWB, entry.Index)
+
+	if compactIndex > 0 {
+		// 真正删除 raftdb 旧日志交给后台 worker 做，apply 线程只负责发任务。
+		d.ScheduleCompactLog(compactIndex)
+	}
+
+	if cb != nil {
+		cb.Done(resp)
+	}
+}
+
+// applyNormalRequests 处理普通 KV 命令：Get/Put/Delete/Snap。
+// 它只操作用户 KV 数据和本条日志的响应，不处理 Region/Raft 管理命令。
+func (d *peerMsgHandler) applyNormalRequests(entry eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	resp := newCmdResp()
 	kvWB := new(engine_util.WriteBatch)
 
@@ -149,14 +243,7 @@ func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry) {
 		resp.Responses = append(resp.Responses, cmdResp)
 	}
 
-	d.peerStorage.applyState.AppliedIndex = entry.Index
-
-	if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
-		panic(err)
-	}
-	if err := kvWB.WriteToDB(d.ctx.engine.Kv); err != nil {
-		panic(err)
-	}
+	d.persistApplyState(kvWB, entry.Index)
 
 	if cb != nil {
 		cb.Done(resp)

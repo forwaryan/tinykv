@@ -94,9 +94,49 @@ func newLog(storage Storage) *RaftLog {
 }
 
 // maybeCompact 会在 Lab2C 中负责丢弃已经被 storage compact 掉的内存日志。
-// 它的目的就是防止 RaftLog 在内存里无限增长，并和快照边界保持一致。
+// storage 是真实 compact 边界，RaftLog.entries 是内存缓存；这里让二者对齐。
+// 否则 sendAppend 可能误以为旧日志还在，错过该发送 snapshot 的时机。
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	firstIndex, err := l.storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+
+	compactIndex := firstIndex - 1
+	offset := l.entries[0].Index
+
+	if compactIndex <= offset {
+		return
+	}
+
+	term, err := l.storage.Term(compactIndex)
+	if err != nil {
+		panic(err)
+	}
+
+	newEntries := []pb.Entry{
+		{
+			Index: compactIndex,
+			Term:  term,
+		},
+	}
+
+	if compactIndex < l.LastIndex() {
+		newEntries = append(newEntries, l.entries[compactIndex-offset+1:]...)
+	}
+
+	l.entries = newEntries
+
+	if l.stabled < compactIndex {
+		l.stabled = compactIndex
+	}
+	if l.committed < compactIndex {
+		l.committed = compactIndex
+	}
+	if l.applied < compactIndex {
+		l.applied = compactIndex
+	}
 }
 
 // allEntries 返回所有还没被 compact 的真实日志。
@@ -141,7 +181,9 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	offset := l.entries[0].Index
 	if i < offset {
-		return l.storage.Term(i)
+		// The entry is before the in-memory compact boundary. Surface this as
+		// ErrCompacted so leaders can fall back to sending a snapshot.
+		return 0, ErrCompacted
 	}
 	if i > l.LastIndex() {
 		return 0, ErrUnavailable

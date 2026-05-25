@@ -375,7 +375,73 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	snapMeta := snapshot.GetMetadata()
+	if snapMeta == nil {
+		return nil, errors.New("snapshot metadata is nil")
+	}
+
+	prevRegion := ps.region
+	newRegion := snapData.GetRegion()
+	if newRegion == nil {
+		return nil, errors.New("snapshot region is nil")
+	}
+
+	// 先清掉旧 region 的 raft log / apply state / region local state。
+	// snapshot 会成为新的日志起点，旧日志不能再保留。
+	if err := ps.clearMeta(kvWB, raftWB); err != nil {
+		return nil, err
+	}
+
+	// 如果 snapshot 里的 region 范围比旧 region 小，需要清理掉旧范围里多出来的数据。
+	ps.clearExtraData(newRegion)
+
+	notifier := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: newRegion.GetId(),
+		Notifier: notifier,
+		SnapMeta: snapMeta,
+		StartKey: prevRegion.GetStartKey(),
+		EndKey:   prevRegion.GetEndKey(),
+	}
+
+	if ok := <-notifier; !ok {
+		return nil, errors.Errorf("apply snapshot failed for region %d", newRegion.GetId())
+	}
+
+	hardState := ps.raftState.HardState
+	if hardState == nil {
+		hardState = &eraftpb.HardState{}
+	}
+	if hardState.Commit < snapMeta.Index {
+		hardState.Commit = snapMeta.Index
+	}
+
+	ps.region = newRegion
+	ps.raftState = &rspb.RaftLocalState{
+		HardState: hardState,
+		LastIndex: snapMeta.Index,
+		LastTerm:  snapMeta.Term,
+	}
+	ps.applyState = &rspb.RaftApplyState{
+		AppliedIndex: snapMeta.Index,
+		TruncatedState: &rspb.RaftTruncatedState{
+			Index: snapMeta.Index,
+			Term:  snapMeta.Term,
+		},
+	}
+
+	meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+	if err := kvWB.SetMeta(meta.ApplyStateKey(newRegion.GetId()), ps.applyState); err != nil {
+		return nil, err
+	}
+
+	log.Infof("%v apply snapshot finished, region %d, index %d, term %d",
+		ps.Tag, newRegion.GetId(), snapMeta.Index, snapMeta.Term)
+
+	return &ApplySnapResult{
+		PrevRegion: prevRegion,
+		Region:     newRegion,
+	}, nil
 }
 
 // SaveReadyState 把 Ready 中的内存状态保存到磁盘。

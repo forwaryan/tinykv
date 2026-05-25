@@ -223,6 +223,8 @@ func newRaft(c *Config) *Raft {
 // leader 用它做正常日志复制，也用它重试那些日志落后或发生冲突的 follower。
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
+	r.RaftLog.maybeCompact()
+
 	pr, ok := r.Prs[to]
 	if !ok {
 		return false
@@ -231,6 +233,25 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevIndex := pr.Next - 1
 	prevTerm, err := r.RaftLog.Term(prevIndex)
 	if err != nil {
+		if err == ErrCompacted {
+			snapshot, snapErr := r.RaftLog.storage.Snapshot()
+			if snapErr == ErrSnapshotTemporarilyUnavailable {
+				return false
+			}
+			if snapErr != nil {
+				panic(snapErr)
+			}
+
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType:  pb.MessageType_MsgSnapshot,
+				From:     r.id,
+				To:       to,
+				Term:     r.Term,
+				Snapshot: &snapshot,
+			})
+			return true
+		}
+
 		return false
 	}
 
@@ -617,6 +638,9 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 		r.sendAppend(m.From)
 		return nil
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
+		return nil
 
 	}
 
@@ -708,6 +732,53 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // Lab2C 会在 follower 落后太多、无法靠普通日志追上时实现它。
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if m.Snapshot == nil || IsEmptySnap(m.Snapshot) {
+		return
+	}
+	if m.Term < r.Term {
+		return
+	}
+
+	meta := m.Snapshot.Metadata
+	r.becomeFollower(m.Term, m.From)
+
+	if meta.Index <= r.RaftLog.committed {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			From:    r.id,
+			To:      m.From,
+			Term:    r.Term,
+			Index:   r.RaftLog.committed,
+		})
+		return
+	}
+
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.RaftLog.committed = meta.Index
+	r.RaftLog.applied = meta.Index
+	r.RaftLog.stabled = meta.Index
+	r.RaftLog.entries = []pb.Entry{
+		{
+			Index: meta.Index,
+			Term:  meta.Term,
+		},
+	}
+
+	r.Prs = make(map[uint64]*Progress)
+	for _, id := range meta.ConfState.Nodes {
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  meta.Index + 1,
+		}
+	}
+
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		From:    r.id,
+		To:      m.From,
+		Term:    r.Term,
+		Index:   meta.Index,
+	})
 }
 
 // addNode 把一个新节点加入 Raft group。

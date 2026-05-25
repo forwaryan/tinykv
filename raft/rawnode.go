@@ -244,16 +244,22 @@ func (rn *RawNode) HasReady() bool {
 // 推进 stabled/applied 等内部进度，为下一批 Ready 做准备。
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	if !IsEmptySnap(&rd.Snapshot) {
+		snapIndex := rd.Snapshot.Metadata.Index
+		rn.Raft.RaftLog.stabled = snapIndex
+		rn.Raft.RaftLog.applied = snapIndex
+		rn.Raft.RaftLog.pendingSnapshot = nil
+	}
+
 	if len(rd.Entries) > 0 {
-		lastEntry := rd.Entries[len(rd.Entries)-1]
-		rn.Raft.RaftLog.stabled = lastEntry.Index
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
 
 	if len(rd.CommittedEntries) > 0 {
-		lastEntry := rd.CommittedEntries[len(rd.CommittedEntries)-1]
-		rn.Raft.RaftLog.applied = lastEntry.Index
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 	}
 
+	rn.Raft.RaftLog.maybeCompact()
 	rn.Raft.msgs = nil
 	rn.prevSoftSt = rn.softState()
 	rn.prevHardSt = rn.hardState()
