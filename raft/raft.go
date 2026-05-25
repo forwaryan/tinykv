@@ -234,6 +234,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevTerm, err := r.RaftLog.Term(prevIndex)
 	if err != nil {
 		if err == ErrCompacted {
+			// follower 需要的 prev log 已经被 leader compact 掉，
+			// 普通 AppendEntries 无法继续对齐，只能改发 snapshot。
 			snapshot, snapErr := r.RaftLog.storage.Snapshot()
 			if snapErr == ErrSnapshotTemporarilyUnavailable {
 				return false
@@ -757,6 +759,8 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	r.RaftLog.committed = meta.Index
 	r.RaftLog.applied = meta.Index
 	r.RaftLog.stabled = meta.Index
+	// 内存日志只保留 snapshot index 处的 dummy entry。
+	// 真正的状态机数据会在上层 raftstore 处理 Ready.Snapshot 时应用。
 	r.RaftLog.entries = []pb.Entry{
 		{
 			Index: meta.Index,
@@ -766,6 +770,8 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 
 	r.Prs = make(map[uint64]*Progress)
 	for _, id := range meta.ConfState.Nodes {
+		// follower 安装 snapshot 后没有 leader 侧复制进度的权威信息。
+		// 这里先用 snapshot 后的下一条日志作为后续复制起点。
 		r.Prs[id] = &Progress{
 			Match: 0,
 			Next:  meta.Index + 1,

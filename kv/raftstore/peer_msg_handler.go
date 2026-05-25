@@ -62,6 +62,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		panic(err)
 	}
 	if applySnapResult != nil {
+		// SaveReadyState 只负责把 snapshot 相关元信息写进 engine 和 PeerStorage。
+		// storeMeta 是 raftstore 的内存路由表，必须在这里跟着刷新。
 		d.applySnapshotResult(applySnapResult)
 	}
 
@@ -74,6 +76,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	d.RaftGroup.Advance(rd)
 }
 
+// applySnapshotResult 把已经成功应用的 snapshot 反映到本地 storeMeta。
+// 后续请求路由、overlap 检查和 split/conf change 都依赖 regionRanges 里的最新范围。
 func (d *peerMsgHandler) applySnapshotResult(result *ApplySnapResult) {
 	if result == nil {
 		return

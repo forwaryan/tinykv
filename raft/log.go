@@ -123,6 +123,7 @@ func (l *RaftLog) maybeCompact() {
 	}
 
 	if compactIndex < l.LastIndex() {
+		// 保留 compactIndex 之后的内存日志；compactIndex 本身只作为 dummy entry。
 		newEntries = append(newEntries, l.entries[compactIndex-offset+1:]...)
 	}
 

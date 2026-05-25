@@ -395,6 +395,8 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// 如果 snapshot 里的 region 范围比旧 region 小，需要清理掉旧范围里多出来的数据。
 	ps.clearExtraData(newRegion)
 
+	// RegionTaskApply 会真正把 snapshot 文件 ingest 到 kv engine。
+	// 这里同步等待完成，保证后面写入的 applyState/raftState 不会领先于实际数据。
 	notifier := make(chan bool, 1)
 	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: newRegion.GetId(),
@@ -416,6 +418,8 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		hardState.Commit = snapMeta.Index
 	}
 
+	// 安装 snapshot 后，本地日志的可读起点变成 snapshot index。
+	// TruncatedState 同步推进，后续 PeerStorage.FirstIndex/Term 会以它为 compact 边界。
 	ps.region = newRegion
 	ps.raftState = &rspb.RaftLocalState{
 		HardState: hardState,
@@ -454,6 +458,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 
 	var applySnapResult *ApplySnapResult
 	if !raft.IsEmptySnap(&ready.Snapshot) {
+		// snapshot 必须先于新 entries 保存：它会重置本地 raft/apply 状态和日志边界。
 		result, err := ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
 		if err != nil {
 			return nil, err

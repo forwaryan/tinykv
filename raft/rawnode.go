@@ -246,6 +246,8 @@ func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 	if !IsEmptySnap(&rd.Snapshot) {
 		snapIndex := rd.Snapshot.Metadata.Index
+		// 上层已经持久化并应用 snapshot，Raft 内存游标也要推进到 snapshot index。
+		// pendingSnapshot 清空后，下一轮 Ready 才不会重复交付同一个快照。
 		rn.Raft.RaftLog.stabled = snapIndex
 		rn.Raft.RaftLog.applied = snapIndex
 		rn.Raft.RaftLog.pendingSnapshot = nil

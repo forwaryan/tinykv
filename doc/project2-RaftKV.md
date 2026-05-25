@@ -203,6 +203,24 @@ In this stage, you may consider these errors, and others will be processed in pr
 > - For the snap command response, should set badger Txn to callback explicitly.
 > - After 2A, some tests you may need to run them multiple times to find bugs
 
+### Lab2B 本地实现说明
+
+Lab2B 的主线是把 Part A 里的 Raft 模块接到 raftstore 状态机上。可以按下面的顺序理解：
+
+1. `RaftStorage` 收到客户端 `Get/Put/Delete/Snap` 请求后，把它包装成 `RaftCmdRequest` 发送给 raftstore。
+2. `peerMsgHandler.proposeRaftCommand` 只负责做基本校验、记录 callback，并把命令 propose 成一条 Raft log。
+3. Raft log 被多数派复制并 commit 后，`RawNode.Ready()` 会把 committed entries 交给 raftstore。
+4. `HandleRaftReady` 必须先调用 `PeerStorage.SaveReadyState` 持久化 HardState 和 entries，再发送 Raft 消息、apply committed entries，最后调用 `RawNode.Advance`。
+5. `applyEntry` 才是真正修改 KV 状态机的地方。它需要按日志顺序执行命令、更新 `RaftApplyState.AppliedIndex`，并通过 callback 唤醒等待中的客户端请求。
+
+实现时要特别注意 `Ready` 的处理顺序。日志和 HardState 必须先落盘，再允许消息发出去；状态机 apply 后也必须同步持久化 `AppliedIndex`。否则重启后可能重复 apply，或者对外暴露一个自己还没有持久化的 Raft 状态。
+
+`applyEntry` 可以拆成三类来理解：
+
+- 空日志：leader 的 noop entry，不改用户数据，但必须推进 `AppliedIndex`。
+- 普通命令：`Get/Put/Delete/Snap`，操作 KV engine 或返回 snapshot 读事务。
+- 管理命令：Lab2C 先处理 `CompactLog`，后续 Lab3 会继续扩展 `ChangePeer` 和 split 相关命令。
+
 ## Part C
 
 As things stand now with your code, it's not practical for a long-running server to remember the complete Raft log forever. Instead, the server will check the number of Raft log, and discard log entries exceeding the threshold from time to time.
@@ -230,3 +248,71 @@ Then the snapshot will reflect in the next Raft ready, so the task you should do
 `PeerStorage.snapState` to `snap.SnapState_Applying` and send `runner.RegionTaskApply` task to region worker through `PeerStorage.regionSched` and wait until region worker finishes.
 
 You should run `make project2c` to pass all the tests.
+
+### Lab2C 本地实现说明
+
+Lab2C 在 Lab2B 的 Ready/apply 框架上增加两条链路：日志压缩和快照安装。
+
+#### 1. CompactLog 的 apply 链路
+
+raftstore 的日志 GC tick 会 propose 一个 `CompactLog` 管理命令。它和普通 KV 命令一样先进入 Raft log，只有 commit 后才能生效。commit 之后，`applyAdminRequest` 需要：
+
+- 更新 `RaftApplyState.TruncatedState.Index/Term`，告诉 `PeerStorage` compact 边界已经推进。
+- 持久化新的 `RaftApplyState.AppliedIndex`。
+- 调用 `ScheduleCompactLog`，把真正删除 raftdb 旧日志的工作交给 raftlog-gc worker。
+
+注意：`TruncatedState` 是逻辑 compact 边界，raftlog-gc worker 删除的是物理日志文件。先推进元信息、再异步清理旧日志，是 TinyKV/TiKV 这类 raftstore 常见的做法。
+
+#### 2. leader 发送 snapshot 的链路
+
+leader 给某个 follower 发送 AppendEntries 时，会根据 follower 的 `Progress.Next` 找 `prevIndex/prevTerm`。如果这个 `prevIndex` 已经小于本地 compact 边界，`RaftLog.Term` 会返回 `ErrCompacted`。这时普通日志复制已经无法补齐 follower，只能：
+
+1. 调用 `Storage.Snapshot()` 请求上层生成或返回 snapshot。
+2. 如果 snapshot 暂时不可用，等待下一轮重试。
+3. snapshot 可用后发送 `MsgSnapshot`。
+
+因此 `RaftLog.maybeCompact`、`RaftLog.Term` 和 `Raft.sendAppend` 必须配合起来：内存日志和 storage compact 边界保持一致，leader 才能在正确时机从 AppendEntries 切换到 snapshot。
+
+#### 3. follower 接收 snapshot 的链路
+
+follower 收到 `MsgSnapshot` 后，Raft 层只处理 Raft 元信息，不直接碰 KV 数据：
+
+- 如果 snapshot 为空或 term 过旧，直接忽略。
+- 如果 snapshot index 不比 committed 新，回复当前 committed index。
+- 否则切成 follower，设置 `pendingSnapshot`，把 committed/applied/stabled 都推进到 snapshot index，并用 snapshot index/term 重建内存 dummy entry。
+- 根据 snapshot metadata 里的 `ConfState` 重建当前 Raft group 的 peer 集合。
+
+这个阶段只是把 snapshot 放进 `Ready.Snapshot`。真正的数据安装发生在 raftstore 的 `PeerStorage.ApplySnapshot`。
+
+#### 4. raftstore 应用 snapshot 的链路
+
+`HandleRaftReady` 拿到包含 snapshot 的 Ready 后，会先调用 `PeerStorage.SaveReadyState`。如果 `Ready.Snapshot` 非空，`SaveReadyState` 会先执行 `ApplySnapshot`：
+
+1. 解析 `RaftSnapshotData`，拿到新的 `Region` 和 snapshot metadata。
+2. 清理旧 region 的 raft/apply/region 元信息。
+3. 调度 `RegionTaskApply`，等待 region worker 把 snapshot 文件 ingest 到 KV engine。
+4. 把 `RaftLocalState.LastIndex/LastTerm`、`RaftApplyState.AppliedIndex`、`TruncatedState` 都重置到 snapshot index/term。
+5. 写回新的 `RegionLocalState` 和 `RaftApplyState`。
+6. 返回 `ApplySnapResult`，由 `HandleRaftReady` 刷新 `storeMeta.regions` 和 `storeMeta.regionRanges`。
+
+最后 `RawNode.Advance` 会看到这个 Ready 里带 snapshot，于是把 Raft 内存游标推进到 snapshot index，并清空 `pendingSnapshot`。如果不清空，下一轮 `Ready` 会重复交付同一个 snapshot。
+
+#### 5. Lab2C 检查点
+
+完成 Lab2C 后，建议至少跑：
+
+```bash
+go test ./raft -run 2C -count=1
+go test ./kv/raftstore -run TestPeerStorage -count=1
+go test ./kv/test_raftstore -run ^TestOneSnapshot2C$ -count=1
+```
+
+重型集成测试可以拆开跑，避免本地资源不足导致一次性跑完整 `-run 2C` 被系统杀掉：
+
+```bash
+go test ./kv/test_raftstore -run ^TestSnapshotRecover2C$ -count=1
+go test ./kv/test_raftstore -run ^TestSnapshotRecoverManyClients2C$ -count=1
+go test ./kv/test_raftstore -run ^TestSnapshotUnreliable2C$ -count=1
+go test ./kv/test_raftstore -run ^TestSnapshotUnreliableRecover2C$ -count=1
+go test ./kv/test_raftstore -run ^TestSnapshotUnreliableRecoverConcurrentPartition2C$ -count=1
+```
