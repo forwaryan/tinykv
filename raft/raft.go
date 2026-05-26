@@ -292,6 +292,16 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	})
 }
 
+// sendTimeoutNow 要求目标节点立刻发起选举，用来完成 leader transfer。
+func (r *Raft) sendTimeoutNow(to uint64) {
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+	})
+}
+
 // tick 推进一次 Raft 内部逻辑时钟。
 // 上层定期调用它；follower/candidate 用它触发选举，leader 用它触发心跳。
 func (r *Raft) tick() {
@@ -349,6 +359,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.State = StateFollower
 	r.Term = term
 	r.Lead = lead
+	// 身份变化后，旧的 leader transfer 目标不再有效。
+	r.leadTransferee = None
 	r.votes = make(map[uint64]bool)
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0
@@ -362,6 +374,8 @@ func (r *Raft) becomeCandidate() {
 	r.State = StateCandidate
 	r.Term++
 	r.Lead = None
+	// 新一轮选举会重新决定 leader，清掉旧的 transfer 状态。
+	r.leadTransferee = None
 	r.Vote = r.id
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true
@@ -378,6 +392,8 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 	r.State = StateLeader
 	r.Lead = r.id
+	// 新 leader 上任后不继承上一任 leader 的 transfer 目标。
+	r.leadTransferee = None
 	r.Vote = r.id
 	r.votes = make(map[uint64]bool)
 	r.heartbeatElapsed = 0
@@ -564,6 +580,10 @@ func (r *Raft) Step(m pb.Message) error {
 		if r.State != StateLeader {
 			return ErrProposalDropped
 		}
+		// leader transfer 进行中不再接收新提案，避免旧 leader 继续追加日志。
+		if r.leadTransferee != None {
+			return ErrProposalDropped
+		}
 
 		if len(m.Entries) == 0 {
 			return nil
@@ -577,6 +597,16 @@ func (r *Raft) Step(m pb.Message) error {
 			ent := *e
 			ent.Term = r.Term
 			ent.Index = lastIndex
+
+			// 同一时间只允许一个未应用的配置变更；后来的 conf change 降级为空普通日志。
+			if ent.EntryType == pb.EntryType_EntryConfChange {
+				if r.PendingConfIndex > r.RaftLog.applied {
+					ent.EntryType = pb.EntryType_EntryNormal
+					ent.Data = nil
+				} else {
+					r.PendingConfIndex = ent.Index
+				}
+			}
 
 			r.RaftLog.entries = append(r.RaftLog.entries, ent)
 		}
@@ -630,6 +660,10 @@ func (r *Raft) Step(m pb.Message) error {
 				r.sendAppend(id)
 			}
 		}
+		// transfer 目标追到 leader 最后一条日志后，立刻让它发起选举。
+		if r.leadTransferee == m.From && pr.Match == r.RaftLog.LastIndex() {
+			r.sendTimeoutNow(m.From)
+		}
 
 		return nil
 	// MsgHeartbeatResponse 是 follower 对 heartbeat 的响应。
@@ -638,17 +672,65 @@ func (r *Raft) Step(m pb.Message) error {
 		if r.State != StateLeader {
 			return nil
 		}
+		// 心跳响应也可能说明 transferee 已追平，避免多等一次 append 响应。
+		if r.leadTransferee == m.From {
+			if pr, ok := r.Prs[m.From]; ok && pr.Match == r.RaftLog.LastIndex() {
+				r.sendTimeoutNow(m.From)
+				return nil
+			}
+		}
 		r.sendAppend(m.From)
 		return nil
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
 		return nil
+	case pb.MessageType_MsgTransferLeader:
+		if r.State == StateFollower {
+			// follower 不做转让决策，只把请求转给当前 leader。
+			if r.Lead != None {
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgTransferLeader,
+					From:    m.From,
+					To:      r.Lead,
+					Term:    r.Term,
+				})
+			}
+			return nil
+		}
+
+		if r.State != StateLeader {
+			return nil
+		}
+
+		// raftstore 会把希望接任的 peer 放在 From，这里用 From 找复制进度。
+		transferee := m.From
+		pr, ok := r.Prs[transferee]
+		if transferee == None || !ok {
+			return nil
+		}
+		if transferee == r.id {
+			r.leadTransferee = None
+			return nil
+		}
+
+		// 记录转让目标；未追平就先补日志，追平后再发送 TimeoutNow。
+		r.leadTransferee = transferee
+		if pr.Match == r.RaftLog.LastIndex() {
+			r.sendTimeoutNow(transferee)
+		} else {
+			r.sendAppend(transferee)
+		}
+		return nil
+	case pb.MessageType_MsgTimeoutNow:
+		// 被移出配置的节点不能再通过 TimeoutNow 发起选举。
+		if _, ok := r.Prs[r.id]; !ok {
+			return nil
+		}
+		// TimeoutNow 本质上是一次立即选举触发。
+		return r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 
 	}
 
-	// 下面这些消息后续阶段会补：
-	// MsgSnapshot：leader 发给落后 follower 的快照安装请求。（2C）
-	// MsgTransferLeader / MsgTimeoutNow：leader transfer 相关消息。（3A）
 	switch r.State {
 	case StateFollower:
 	case StateCandidate:
@@ -790,12 +872,51 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode 把一个新节点加入 Raft group。
 // Lab3A 会在配置变更日志提交后实现它，用来开始跟踪新 peer 的复制进度。
 func (r *Raft) addNode(id uint64) {
-	// Your Code Here (3A).
+	if id == None {
+		return
+	}
+
+	if _, ok := r.Prs[id]; ok {
+		// 重复 add 不改变进度，但这条配置变更已经应用完。
+		r.PendingConfIndex = 0
+		return
+	}
+
+	// 新 peer 从 leader 最后一条日志之后开始追赶。
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  r.RaftLog.LastIndex() + 1,
+	}
+	// 本次配置变更已经生效，可以接受下一条 conf change。
+	r.PendingConfIndex = 0
 }
 
 // removeNode 从 Raft group 中移除一个节点。
 // Lab3A 会在配置变更日志提交后实现它，用来停止跟踪该 peer，
 // 并在必要时重新计算 commit 进度。
 func (r *Raft) removeNode(id uint64) {
-	// Your Code Here (3A).
+	if id == None {
+		return
+	}
+
+	// 删除复制进度后，该节点不再参与 quorum。
+	delete(r.Prs, id)
+
+	if r.leadTransferee == id {
+		// transfer 目标被移除时，取消正在进行的转让。
+		r.leadTransferee = None
+	}
+
+	// 配置变更应用完成，释放 pending 标记。
+	r.PendingConfIndex = 0
+
+	// quorum 变小后，原本未能提交的日志可能现在可以提交。
+	if r.State == StateLeader && r.maybeCommit() {
+		for peerID := range r.Prs {
+			if peerID == r.id {
+				continue
+			}
+			r.sendAppend(peerID)
+		}
+	}
 }
