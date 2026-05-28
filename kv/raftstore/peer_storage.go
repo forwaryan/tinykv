@@ -381,6 +381,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	}
 
 	prevRegion := ps.region
+	prevInitialized := ps.isInitialized()
 	newRegion := snapData.GetRegion()
 	if newRegion == nil {
 		return nil, errors.New("snapshot region is nil")
@@ -392,18 +393,23 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
-	// 如果 snapshot 里的 region 范围比旧 region 小，需要清理掉旧范围里多出来的数据。
-	ps.clearExtraData(newRegion)
+	// replicated peer 初始只有 regionID，没有可信的 key range。
+	// 只有旧 Region 已初始化时，才能用旧范围去清理不再属于新 Region 的数据。
+	// 如果旧范围是占位的空范围 [, )，这里清理会误删本 store 上其他 Region 的数据。
+	if prevInitialized {
+		ps.clearExtraData(newRegion)
+	}
 
 	// RegionTaskApply 会真正把 snapshot 文件 ingest 到 kv engine。
 	// 这里同步等待完成，保证后面写入的 applyState/raftState 不会领先于实际数据。
+	// apply worker 只需要清理并导入 snapshot 覆盖的新 Region 范围。
 	notifier := make(chan bool, 1)
 	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: newRegion.GetId(),
 		Notifier: notifier,
 		SnapMeta: snapMeta,
-		StartKey: prevRegion.GetStartKey(),
-		EndKey:   prevRegion.GetEndKey(),
+		StartKey: newRegion.GetStartKey(),
+		EndKey:   newRegion.GetEndKey(),
 	}
 
 	if ok := <-notifier; !ok {

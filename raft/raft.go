@@ -150,19 +150,12 @@ type Raft struct {
 	// valid message from current leader when it is a follower.
 	electionElapsed int
 
-	// leadTransferee is id of the leader transfer target when its value is not zero.
-	// Follow the procedure defined in section 3.10 of Raft phd thesis.
-	// (https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf)
-	// (Used in 3A leader transfer)
+	// leadTransferee 记录正在接收 leader 身份的目标节点。
+	// 非 0 表示 leader transfer 正在进行；leader 会先让目标追日志，追平后发送 TimeoutNow。
 	leadTransferee uint64
 
-	// Only one conf change may be pending (in the log, but not yet
-	// applied) at a time. This is enforced via PendingConfIndex, which
-	// is set to a value >= the log index of the latest pending
-	// configuration change (if any). Config changes are only allowed to
-	// be proposed if the leader's applied index is greater than this
-	// value.
-	// (Used in 3A conf change)
+	// PendingConfIndex 记录还没 apply 完的配置变更日志 index。
+	// Raft 一次只能有一个未完成 conf change，避免两个成员集合变更交错导致 quorum 语义不清。
 	PendingConfIndex uint64
 }
 
@@ -283,12 +276,18 @@ func (r *Raft) sendAppend(to uint64) bool {
 // leader 用心跳维持自己的权威，并告诉 follower 当前最新的 committed index。
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	commit := r.RaftLog.committed
+	// 新加入的 peer 还没有复制进度，raftstore 需要 Commit=0 的 heartbeat
+	// 来把这条消息识别成 initial message，并在目标 store 上创建 peer。
+	if pr, ok := r.Prs[to]; ok && pr.Match == 0 {
+		commit = 0
+	}
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		From:    r.id,
 		To:      to,
 		Term:    r.Term,
-		Commit:  r.RaftLog.committed,
+		Commit:  commit,
 	})
 }
 
@@ -580,7 +579,8 @@ func (r *Raft) Step(m pb.Message) error {
 		if r.State != StateLeader {
 			return ErrProposalDropped
 		}
-		// leader transfer 进行中不再接收新提案，避免旧 leader 继续追加日志。
+		// leader transfer 进行中不再接收新提案。
+		// 这样可以让旧 leader 停止追加新日志，目标节点追平后能尽快接任。
 		if r.leadTransferee != None {
 			return ErrProposalDropped
 		}
@@ -598,7 +598,9 @@ func (r *Raft) Step(m pb.Message) error {
 			ent.Term = r.Term
 			ent.Index = lastIndex
 
-			// 同一时间只允许一个未应用的配置变更；后来的 conf change 降级为空普通日志。
+			// 同一时间只允许一个未应用的配置变更。
+			// 如果上一条 conf change 还没 apply，就把新的 conf change 降级成空普通日志，
+			// 让它仍然按正常日志复制/提交，但不会再次改变成员集合。
 			if ent.EntryType == pb.EntryType_EntryConfChange {
 				if r.PendingConfIndex > r.RaftLog.applied {
 					ent.EntryType = pb.EntryType_EntryNormal
@@ -661,6 +663,7 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 		}
 		// transfer 目标追到 leader 最后一条日志后，立刻让它发起选举。
+		// 这里用 Match == LastIndex 判断“目标已经具备接任所需的最新日志”。
 		if r.leadTransferee == m.From && pr.Match == r.RaftLog.LastIndex() {
 			r.sendTimeoutNow(m.From)
 		}
@@ -687,6 +690,7 @@ func (r *Raft) Step(m pb.Message) error {
 	case pb.MessageType_MsgTransferLeader:
 		if r.State == StateFollower {
 			// follower 不做转让决策，只把请求转给当前 leader。
+			// m.From 保留真正的 transferee，leader 收到后仍然能知道目标是谁。
 			if r.Lead != None {
 				r.msgs = append(r.msgs, pb.Message{
 					MsgType: pb.MessageType_MsgTransferLeader,
@@ -702,18 +706,21 @@ func (r *Raft) Step(m pb.Message) error {
 			return nil
 		}
 
-		// raftstore 会把希望接任的 peer 放在 From，这里用 From 找复制进度。
+		// raftstore/RawNode.TransferLeader 会把希望接任的 peer 放在 From。
+		// 这里用 From 而不是 To，因为消息的 To 是当前处理消息的 leader。
 		transferee := m.From
 		pr, ok := r.Prs[transferee]
 		if transferee == None || !ok {
 			return nil
 		}
 		if transferee == r.id {
+			// 目标本来就是 leader，不需要转让。
 			r.leadTransferee = None
 			return nil
 		}
 
 		// 记录转让目标；未追平就先补日志，追平后再发送 TimeoutNow。
+		// TimeoutNow 会让目标节点绕过正常选举超时，立即发起选举。
 		r.leadTransferee = transferee
 		if pr.Match == r.RaftLog.LastIndex() {
 			r.sendTimeoutNow(transferee)
@@ -878,11 +885,13 @@ func (r *Raft) addNode(id uint64) {
 
 	if _, ok := r.Prs[id]; ok {
 		// 重复 add 不改变进度，但这条配置变更已经应用完。
+		// 这里仍然清 pending，避免后续合法 conf change 被一直挡住。
 		r.PendingConfIndex = 0
 		return
 	}
 
-	// 新 peer 从 leader 最后一条日志之后开始追赶。
+	// 新 peer 初始没有任何已复制日志，Match=0。
+	// Next 放在 leader 最后一条日志之后，后续 Append 失败时会逐步回退或通过 snapshot 追上。
 	r.Prs[id] = &Progress{
 		Match: 0,
 		Next:  r.RaftLog.LastIndex() + 1,
@@ -912,6 +921,7 @@ func (r *Raft) removeNode(id uint64) {
 
 	// quorum 变小后，原本未能提交的日志可能现在可以提交。
 	if r.State == StateLeader && r.maybeCommit() {
+		// committed 推进后要立刻通知其他 peer，否则 follower 可能要等下一轮心跳才知道新 commit。
 		for peerID := range r.Prs {
 			if peerID == r.id {
 				continue

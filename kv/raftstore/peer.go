@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/config"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
@@ -47,13 +48,49 @@ func createPeer(storeID uint64, cfg *config.Config, sched chan<- worker.Task,
 // will be retrieved later after applying snapshot.
 func replicatePeer(storeID uint64, cfg *config.Config, sched chan<- worker.Task,
 	engines *engine_util.Engines, regionID uint64, metaPeer *metapb.Peer) (*peer, error) {
-	// We will remove tombstone key when apply snapshot
+	// AddPeer 可能把同一个 regionID 重新加回这个 store。
+	// 创建新 peer 前先清掉旧 peer 残留的 apply/raft/region meta，避免新 peer 读到旧状态。
+	if err := clearStalePeerMeta(engines, regionID); err != nil {
+		return nil, err
+	}
 	log.Infof("[region %v] replicates peer with ID %d", regionID, metaPeer.GetId())
+	// replicated peer 此时还没有 snapshot，所以只能先用空 Region 占位。
+	// 完整的 start/end/peers 会在后续 ApplySnapshot 时安装进 PeerStorage。
 	region := &metapb.Region{
 		Id:          regionID,
 		RegionEpoch: &metapb.RegionEpoch{},
 	}
 	return NewPeer(storeID, cfg, engines, region, sched, metaPeer)
+}
+
+// clearStalePeerMeta 清理同一个 regionID 之前留下的本地元信息。
+// replicated peer 初始只知道 regionID/peerID，后续会通过 snapshot 拿到完整 Region。
+func clearStalePeerMeta(engines *engine_util.Engines, regionID uint64) error {
+	lastIndex := uint64(0)
+
+	// ClearMeta 删除 raft log 时需要知道旧日志的上界。
+	// 如果 raft state 已经不存在，就说明没有旧 raft log 需要按 index 清理。
+	raftState, err := meta.GetRaftLocalState(engines.Raft, regionID)
+	if err != nil && err != badger.ErrKeyNotFound {
+		return err
+	}
+	if err == nil {
+		lastIndex = raftState.GetLastIndex()
+	}
+
+	kvWB := new(engine_util.WriteBatch)
+	raftWB := new(engine_util.WriteBatch)
+
+	// 这里会删除 RegionState/ApplyState、RaftState，以及 [0,lastIndex] 范围内的旧 raft log。
+	// 清理后 NewPeerStorage 会从干净状态初始化，避免 lastIndex 和 appliedIndex 混用新旧值。
+	// 注意这里不清用户 KV 数据；真正的数据范围要等 snapshot 带来完整 Region 后再处理。
+	if err := ClearMeta(engines, kvWB, raftWB, regionID, lastIndex); err != nil {
+		return err
+	}
+	if err := kvWB.WriteToDB(engines.Kv); err != nil {
+		return err
+	}
+	return raftWB.WriteToDB(engines.Raft)
 }
 
 type proposal struct {
@@ -184,7 +221,7 @@ func (p *peer) nextProposalIndex() uint64 {
 	return p.RaftGroup.Raft.RaftLog.LastIndex() + 1
 }
 
-/// Tries to destroy itself. Returns a job (if needed) to do more cleaning tasks.
+// Tries to destroy itself. Returns a job (if needed) to do more cleaning tasks.
 func (p *peer) MaybeDestroy() bool {
 	if p.stopped {
 		log.Infof("%v is being destroyed, skip", p.Tag)
@@ -193,10 +230,10 @@ func (p *peer) MaybeDestroy() bool {
 	return true
 }
 
-/// Does the real destroy worker.Task which includes:
-/// 1. Set the region to tombstone;
-/// 2. Clear data;
-/// 3. Notify all pending requests.
+// Does the real destroy worker.Task which includes:
+// 1. Set the region to tombstone;
+// 2. Clear data;
+// 3. Notify all pending requests.
 func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 	start := time.Now()
 	region := p.Region()
@@ -244,10 +281,10 @@ func (p *peer) Region() *metapb.Region {
 	return p.peerStorage.Region()
 }
 
-/// Set the region of a peer.
-///
-/// This will update the region of the peer, caller must ensure the region
-/// has been preserved in a durable device.
+// Set the region of a peer.
+//
+// This will update the region of the peer, caller must ensure the region
+// has been preserved in a durable device.
 func (p *peer) SetRegion(region *metapb.Region) {
 	p.peerStorage.SetRegion(region)
 }
@@ -273,7 +310,7 @@ func (p *peer) Send(trans Transport, msgs []eraftpb.Message) {
 	}
 }
 
-/// Collects all pending peers and update `peers_start_pending_time`.
+// Collects all pending peers and update `peers_start_pending_time`.
 func (p *peer) CollectPendingPeers() []*metapb.Peer {
 	pendingPeers := make([]*metapb.Peer, 0, len(p.Region().GetPeers()))
 	truncatedIdx := p.peerStorage.truncatedIndex()
@@ -301,8 +338,8 @@ func (p *peer) clearPeersStartPendingTime() {
 	}
 }
 
-/// Returns `true` if any new peer catches up with the leader in replicating logs.
-/// And updates `PeersStartPendingTime` if needed.
+// Returns `true` if any new peer catches up with the leader in replicating logs.
+// And updates `PeersStartPendingTime` if needed.
 func (p *peer) AnyNewPeerCatchUp(peerId uint64) bool {
 	if len(p.PeersStartPendingTime) == 0 {
 		return false

@@ -145,6 +145,8 @@ func (rn *RawNode) ProposeConfChange(cc pb.ConfChange) error {
 	if err != nil {
 		return err
 	}
+	// ConfChange 必须作为 EntryConfChange 进入 Raft log。
+	// 这样 raft 层才能用 PendingConfIndex 限制同一时间只有一个配置变更。
 	ent := pb.Entry{EntryType: pb.EntryType_EntryConfChange, Data: data}
 	return rn.Raft.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
@@ -156,6 +158,7 @@ func (rn *RawNode) ProposeConfChange(cc pb.ConfChange) error {
 // 它会返回新的 ConfState，后续快照需要持久化这个配置状态。
 func (rn *RawNode) ApplyConfChange(cc pb.ConfChange) *pb.ConfState {
 	if cc.NodeId == None {
+		// NodeId 为 0 表示上层取消这次配置变更；仍然要返回当前 ConfState。
 		return &pb.ConfState{Nodes: nodes(rn.Raft)}
 	}
 	switch cc.ChangeType {
@@ -282,5 +285,7 @@ func (rn *RawNode) GetProgress() map[uint64]Progress {
 // TransferLeader 尝试把 leader 身份转移给指定节点。
 // 这只是发起转移请求，是否成功取决于目标节点日志是否追上等 Raft 状态。
 func (rn *RawNode) TransferLeader(transferee uint64) {
+	// Lab3A 约定把 transferee 放在 From 字段。
+	// Step 里当前 leader 会用 From 找目标节点的 Progress，并决定补日志或发送 TimeoutNow。
 	_ = rn.Raft.Step(pb.Message{MsgType: pb.MessageType_MsgTransferLeader, From: transferee})
 }

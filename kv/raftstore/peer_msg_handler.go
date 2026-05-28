@@ -99,29 +99,31 @@ func (d *peerMsgHandler) applySnapshotResult(result *ApplySnapResult) {
 // applyEntry 执行一条已经被 Raft commit 的日志。
 // Raft 只保证所有 peer 看到同一条日志；真正修改 KV、元信息并回调客户端是在这里发生。
 func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry) {
-	if entry.EntryType != eraftpb.EntryType_EntryNormal {
-		return
-	}
-
 	// 只有本 peer 自己 propose 的日志才会有 callback；从 leader 复制来的日志也要照常 apply。
 	cb := d.findProposal(entry.Index, entry.Term)
 
-	if len(entry.Data) == 0 {
-		d.applyEmptyEntry(entry, cb)
-		return
-	}
+	switch entry.EntryType {
+	case eraftpb.EntryType_EntryNormal:
+		if len(entry.Data) == 0 {
+			d.applyEmptyEntry(entry, cb)
+			return
+		}
 
-	req := new(raft_cmdpb.RaftCmdRequest)
-	if err := req.Unmarshal(entry.Data); err != nil {
-		panic(err)
-	}
+		req := new(raft_cmdpb.RaftCmdRequest)
+		if err := req.Unmarshal(entry.Data); err != nil {
+			panic(err)
+		}
 
-	if req.GetAdminRequest() != nil {
-		d.applyAdminRequest(entry, req, cb)
-		return
-	}
+		if req.GetAdminRequest() != nil {
+			d.applyAdminRequest(entry, req, cb)
+			return
+		}
 
-	d.applyNormalRequests(entry, req, cb)
+		d.applyNormalRequests(entry, req, cb)
+
+	case eraftpb.EntryType_EntryConfChange:
+		d.applyConfChange(entry, cb)
+	}
 }
 
 // persistApplyState 记录状态机已经 apply 到哪个 Raft log index。
@@ -148,8 +150,228 @@ func (d *peerMsgHandler) applyEmptyEntry(entry eraftpb.Entry, cb *message.Callba
 	}
 }
 
+// applyConfChange 处理已经 commit 的成员变更日志。
+// propose 阶段只是在 Raft log 里写入 EntryConfChange；真正修改 Region 元信息和 Raft 成员表在这里完成。
+func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry, cb *message.Callback) {
+	resp := newCmdResp()
+	kvWB := new(engine_util.WriteBatch)
+
+	cc := new(eraftpb.ConfChange)
+	if err := cc.Unmarshal(entry.Data); err != nil {
+		panic(err)
+	}
+
+	// cc.Context 里保存的是 propose 阶段的完整 RaftCmdRequest。
+	// Raft 层只理解 NodeId/ChangeType，raftstore 还需要原请求里的 Peer/Region 信息来更新元数据。
+	req := new(raft_cmdpb.RaftCmdRequest)
+	if err := req.Unmarshal(cc.Context); err != nil {
+		panic(err)
+	}
+
+	adminReq := req.GetAdminRequest()
+	changePeer := adminReq.GetChangePeer()
+	if changePeer == nil || changePeer.GetPeer() == nil {
+		panic("missing change peer request")
+	}
+
+	peer := changePeer.GetPeer()
+
+	// 复制一份 Region 元信息来修改，避免直接在旧对象上半更新。
+	region := new(metapb.Region)
+	if err := util.CloneMsg(d.Region(), region); err != nil {
+		panic(err)
+	}
+	if region.RegionEpoch == nil {
+		region.RegionEpoch = &metapb.RegionEpoch{}
+	}
+
+	regionChanged := false
+	removedSelf := false
+
+	switch changePeer.GetChangeType() {
+	case eraftpb.ConfChangeType_AddNode:
+		exists := false
+		for _, p := range region.GetPeers() {
+			if p.GetId() == peer.GetId() || p.GetStoreId() == peer.GetStoreId() {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			// AddNode 改的是 Region.Peers，因此只推进 ConfVer，不修改 Version。
+			newPeer := *peer
+			region.Peers = append(region.Peers, &newPeer)
+			region.RegionEpoch.ConfVer++
+			regionChanged = true
+		}
+
+	case eraftpb.ConfChangeType_RemoveNode:
+		for i, p := range region.GetPeers() {
+			if p.GetId() == peer.GetId() {
+				// RemoveNode 同样只改变副本集合；如果删除的是自己，apply 完后要销毁本地 peer。
+				region.Peers = append(region.Peers[:i], region.Peers[i+1:]...)
+				region.RegionEpoch.ConfVer++
+				regionChanged = true
+				removedSelf = p.GetId() == d.PeerId()
+				break
+			}
+		}
+
+	default:
+		panic(fmt.Sprintf("unexpected conf change type %v", changePeer.GetChangeType()))
+	}
+
+	if regionChanged {
+		// Region.Peers / ConfVer 是 raftstore 元信息，必须和 applied index 一起持久化。
+		meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+	}
+
+	d.persistApplyState(kvWB, entry.Index)
+
+	if regionChanged {
+		// 持久化成功后再更新内存视图，保证重启和运行时看到的 Region 元信息一致。
+		d.SetRegion(region)
+
+		if changePeer.GetChangeType() == eraftpb.ConfChangeType_AddNode {
+			d.insertPeerCache(peer)
+		} else {
+			d.removePeerCache(peer.GetId())
+		}
+
+		// storeMeta 是内存路由表，也要同步到最新 Region 信息。
+		d.ctx.storeMeta.Lock()
+		d.ctx.storeMeta.regions[region.GetId()] = region
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
+		d.ctx.storeMeta.Unlock()
+	}
+
+	// 这一步才是真正修改 Lab3A 里的 Raft 内部成员表 r.Prs。
+	d.RaftGroup.ApplyConfChange(*cc)
+
+	resp.AdminResponse = &raft_cmdpb.AdminResponse{
+		CmdType: raft_cmdpb.AdminCmdType_ChangePeer,
+		ChangePeer: &raft_cmdpb.ChangePeerResponse{
+			Region: region,
+		},
+	}
+
+	if cb != nil {
+		cb.Done(resp)
+	}
+
+	if removedSelf {
+		// 自己被配置变更移除后，不再服务这个 Region，也不能继续接收新的请求。
+		d.destroyPeer()
+		return
+	}
+
+	if regionChanged && d.IsLeader() {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
+}
+
+// applySplit 处理已经 commit 的 split admin command。
+// Split 不改变 Raft 成员，而是把当前 Region 的 key range 拆成两个 Region。
+func (d *peerMsgHandler) applySplit(entry eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, resp *raft_cmdpb.RaftCmdResponse, kvWB *engine_util.WriteBatch) {
+	splitReq := req.GetAdminRequest().GetSplit()
+	if splitReq == nil {
+		BindRespError(resp, errors.New("missing split request"))
+		return
+	}
+
+	oldRegion := d.Region()
+	splitKey := splitReq.GetSplitKey()
+
+	// splitKey 必须在当前 Region 内部，不能等于 start/end。
+	if err := util.CheckKeyInRegionExclusive(splitKey, oldRegion); err != nil {
+		BindRespError(resp, err)
+		return
+	}
+
+	if len(splitReq.GetNewPeerIds()) != len(oldRegion.GetPeers()) {
+		BindRespError(resp, errors.Errorf("new peer count %d != old peer count %d",
+			len(splitReq.GetNewPeerIds()), len(oldRegion.GetPeers())))
+		return
+	}
+
+	newVersion := oldRegion.GetRegionEpoch().GetVersion() + 1
+	confVer := oldRegion.GetRegionEpoch().GetConfVer()
+
+	// Split 只改变 key range，不改变副本集合：
+	// left 沿用旧 Region ID/Peers，right 使用 scheduler 分配的新 Region ID/Peer IDs。
+	left := new(metapb.Region)
+	if err := util.CloneMsg(oldRegion, left); err != nil {
+		panic(err)
+	}
+	left.EndKey = util.SafeCopy(splitKey)
+	left.RegionEpoch = &metapb.RegionEpoch{
+		ConfVer: confVer,
+		Version: newVersion,
+	}
+
+	right := &metapb.Region{
+		Id:       splitReq.GetNewRegionId(),
+		StartKey: util.SafeCopy(splitKey),
+		EndKey:   util.SafeCopy(oldRegion.GetEndKey()),
+		RegionEpoch: &metapb.RegionEpoch{
+			ConfVer: confVer,
+			Version: newVersion,
+		},
+	}
+
+	for i, oldPeer := range oldRegion.GetPeers() {
+		// right Region 仍放在同一批 store 上，只是每个 store 上的 peer id 换成新的。
+		right.Peers = append(right.Peers, &metapb.Peer{
+			Id:      splitReq.GetNewPeerIds()[i],
+			StoreId: oldPeer.GetStoreId(),
+		})
+	}
+
+	// 每个旧 Region peer apply 到 split 日志时，都会在自己的 store 上创建对应的 right peer。
+	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, right)
+	if err != nil {
+		panic(err)
+	}
+
+	// 两个 Region 的元信息都要持久化；apply state 由外层 applyAdminRequest 统一推进。
+	meta.WriteRegionState(kvWB, left, rspb.PeerState_Normal)
+	meta.WriteRegionState(kvWB, right, rspb.PeerState_Normal)
+
+	parentWasLeader := d.IsLeader()
+
+	// 当前 peer 继续服务左半边 Region；右半边交给刚创建的 newPeer。
+	d.SetRegion(left)
+	d.SizeDiffHint = 0
+	d.ApproximateSize = nil
+
+	// storeMeta 是本 store 的内存路由表。split 后旧范围必须替换成 left/right 两段。
+	d.ctx.storeMeta.Lock()
+	d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: oldRegion})
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: left})
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: right})
+	d.ctx.storeMeta.regions[left.GetId()] = left
+	d.ctx.storeMeta.regions[right.GetId()] = right
+	d.ctx.storeMeta.Unlock()
+
+	d.ctx.router.register(newPeer)
+	// 如果父 Region 原来是 leader，让 right peer 尽快发起选举，减少 split 后无 leader 的窗口。
+	newPeer.MaybeCampaign(parentWasLeader)
+	_ = d.ctx.router.send(right.GetId(), message.Msg{Type: message.MsgTypeStart})
+
+	resp.AdminResponse = &raft_cmdpb.AdminResponse{
+		CmdType: raft_cmdpb.AdminCmdType_Split,
+		Split: &raft_cmdpb.SplitResponse{
+			Regions: []*metapb.Region{left, right},
+		},
+	}
+
+	if parentWasLeader {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
+}
+
 // applyAdminRequest 处理 raftstore 管理命令。
-// 这类命令修改 Region/Raft 元信息；当前 Lab2C 先实现 CompactLog。
+// 这类命令修改 Region/Raft 元信息；CompactLog 和 Split 都在 apply 阶段真正生效。
 func (d *peerMsgHandler) applyAdminRequest(entry eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	resp := newCmdResp()
 	kvWB := new(engine_util.WriteBatch)
@@ -178,6 +400,8 @@ func (d *peerMsgHandler) applyAdminRequest(entry eraftpb.Entry, req *raft_cmdpb.
 			CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
 			CompactLog: &raft_cmdpb.CompactLogResponse{},
 		}
+	case raft_cmdpb.AdminCmdType_Split:
+		d.applySplit(entry, req, resp, kvWB)
 	}
 
 	d.persistApplyState(kvWB, entry.Index)
@@ -197,6 +421,18 @@ func (d *peerMsgHandler) applyAdminRequest(entry eraftpb.Entry, req *raft_cmdpb.
 func (d *peerMsgHandler) applyNormalRequests(entry eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	resp := newCmdResp()
 	kvWB := new(engine_util.WriteBatch)
+
+	// 请求进入 Raft 前检查过 epoch，但日志真正 apply 时 Region 可能已经 split。
+	// 这里再检查一次，避免旧 epoch 的读写继续落到 split 后的旧 Region 上。
+	if err := d.checkAppliedRequestEpoch(req); err != nil {
+		BindRespError(resp, err)
+		// 日志已经被处理，即使返回 EpochNotMatch，也必须推进 AppliedIndex，避免重启后重复 apply。
+		d.persistApplyState(kvWB, entry.Index)
+		if cb != nil {
+			cb.Done(resp)
+		}
+		return
+	}
 
 	for _, request := range req.GetRequests() {
 		cmdResp := &raft_cmdpb.Response{
@@ -252,6 +488,18 @@ func (d *peerMsgHandler) applyNormalRequests(entry eraftpb.Entry, req *raft_cmdp
 	if cb != nil {
 		cb.Done(resp)
 	}
+}
+
+// checkAppliedRequestEpoch 在状态机真正执行普通请求前复查 RegionEpoch。
+// propose 阶段到 apply 阶段之间可能插入 split 日志，导致请求里的 epoch 已经过期。
+func (d *peerMsgHandler) checkAppliedRequestEpoch(req *raft_cmdpb.RaftCmdRequest) error {
+	err := util.CheckRegionEpoch(req, d.Region(), true)
+	if errEpochNotMatching, ok := err.(*util.ErrEpochNotMatch); ok {
+		if siblingRegion := d.findSiblingRegion(); siblingRegion != nil {
+			errEpochNotMatching.Regions = append(errEpochNotMatching.Regions, siblingRegion)
+		}
+	}
+	return err
 }
 
 func (d *peerMsgHandler) findProposal(index uint64, term uint64) *message.Callback {
@@ -344,15 +592,84 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
-// proposeRaftCommand 是 Lab2B 中把客户端/admin 命令提交进 Raft 的入口。
-// 它会序列化已验证的命令，propose 到当前 Region 的 Raft group，
-// 并保存 callback，等日志 apply 后再回调客户端。
+// proposeRaftCommand 是客户端/admin 命令进入当前 Region Raft group 的入口。
+// 大多数命令会被复制成 Raft log；少数本地动作会在这里直接交给 RawNode 处理。
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	// 先做 leader、peer、term、epoch 等检查，避免过期请求进入 Raft。
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
 	}
+
+	adminReq := msg.GetAdminRequest()
+	if adminReq != nil && adminReq.GetCmdType() == raft_cmdpb.AdminCmdType_TransferLeader {
+		// TransferLeader 是本地控制动作，不需要复制成一条 Raft 日志。
+		// 真正的转让流程由 Lab3A 的 RawNode.TransferLeader / MsgTimeoutNow 完成。
+		transferLeader := adminReq.GetTransferLeader()
+		if transferLeader == nil || transferLeader.GetPeer() == nil {
+			if cb != nil {
+				cb.Done(ErrResp(errors.New("missing transfer leader peer")))
+			}
+			return
+		}
+
+		d.RaftGroup.TransferLeader(transferLeader.GetPeer().GetId())
+
+		// 因为没有日志会被 apply，这里直接返回 admin response 给调用方。
+		resp := newCmdResp()
+		resp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+			TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+		}
+		if cb != nil {
+			cb.Done(resp)
+		}
+		return
+	}
+
+	if adminReq != nil && adminReq.GetCmdType() == raft_cmdpb.AdminCmdType_ChangePeer {
+		// ChangePeer 会改变 Raft 成员集合，必须走 EntryConfChange。
+		// 这样 Lab3A 的 PendingConfIndex 才能限制同一时间只有一个配置变更。
+		changePeer := adminReq.GetChangePeer()
+		if changePeer == nil || changePeer.GetPeer() == nil {
+			if cb != nil {
+				cb.Done(ErrResp(errors.New("missing change peer")))
+			}
+			return
+		}
+
+		// Context 保存完整 RaftCmdRequest；apply 阶段还要用它更新 Region.Peers 和 response。
+		data, err := msg.Marshal()
+		if err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+
+		// Raft 层只关心变更类型和 peer id，Region/Store 元信息留在 Context 里给 raftstore 使用。
+		cc := eraftpb.ConfChange{
+			ChangeType: changePeer.GetChangeType(),
+			NodeId:     changePeer.GetPeer().GetId(),
+			Context:    data,
+		}
+
+		// ConfChange 也需要保存 callback，等这条 EntryConfChange 被 commit/apply 后再回复。
+		index := d.nextProposalIndex()
+		term := d.Term()
+
+		if err := d.RaftGroup.ProposeConfChange(cc); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+
+		d.proposals = append(d.proposals, &proposal{
+			index: index,
+			term:  term,
+			cb:    cb,
+		})
+		return
+	}
+	// 其他命令仍然走普通 Raft 日志复制，等 commit/apply 后再通过 callback 回复。
 	data, err := msg.Marshal()
 	if err != nil {
 		cb.Done(ErrResp(err))
