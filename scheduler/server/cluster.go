@@ -276,11 +276,69 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 	return nil
 }
 
+func isRegionHeartbeatStale(origin, region *core.RegionInfo) bool {
+	originEpoch := origin.GetMeta().GetRegionEpoch()
+	regionEpoch := region.GetMeta().GetRegionEpoch()
+
+	// RegionEpoch 是 scheduler 判断 heartbeat 新旧的核心依据：
+	// Version 代表 key range 的变化，ConfVer 代表 peer 配置的变化。
+	return regionEpoch.GetVersion() < originEpoch.GetVersion() ||
+		regionEpoch.GetConfVer() < originEpoch.GetConfVer()
+}
+
+func collectRegionStoreIDs(region *core.RegionInfo, storeIDs map[uint64]struct{}) {
+	if region == nil {
+		return
+	}
+
+	// Region 更新后会影响这些 store 上的 region/leader/size 统计，
+	// 因此先收集起来，等 PutRegion 后统一刷新 store status。
+	for storeID := range region.GetStoreIds() {
+		storeIDs[storeID] = struct{}{}
+	}
+}
+
 // processRegionHeartbeat 更新 scheduler 维护的 Region 信息。
 // Lab3C 会用 Region heartbeat 刷新 Region 范围、leader、peers、大小等元数据，
 // balance scheduler 后续会根据这些信息做调度。
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
-	// Your Code Here (3C).
+	c.Lock()
+	defer c.Unlock()
+
+	// 如果 scheduler 已经记录了同 ID 的 Region，新 heartbeat 不能比旧记录更老。
+	origin := c.core.GetRegion(region.GetID())
+	if origin != nil && isRegionHeartbeatStale(origin, region) {
+		return errors.Errorf("region %d heartbeat is stale", region.GetID())
+	}
+
+	// split/merge 后，新的 Region 可能和旧 Region 的 key range 重叠但 ID 不同。
+	// 这里用 overlap 检查避免旧 heartbeat 覆盖 scheduler 中更新的 range 视图。
+	overlaps := c.core.GetOverlaps(region)
+	for _, overlap := range overlaps {
+		if overlap.GetID() == region.GetID() {
+			continue
+		}
+		if isRegionHeartbeatStale(overlap, region) {
+			return errors.Errorf("region %d heartbeat is stale", region.GetID())
+		}
+	}
+
+	// PutRegion 可能会替换旧 Region 或删除 overlap Region。
+	// 在更新前先记录所有受影响的 store，避免更新后找不到被删除 Region 的 store 信息。
+	affectedStores := make(map[uint64]struct{})
+	collectRegionStoreIDs(origin, affectedStores)
+	collectRegionStoreIDs(region, affectedStores)
+	for _, overlap := range overlaps {
+		collectRegionStoreIDs(overlap, affectedStores)
+	}
+
+	// 更新 scheduler 的 Region 索引，包括 region tree、leader/follower/pending peer 等视图。
+	c.core.PutRegion(region)
+
+	// 重新计算受影响 store 的统计信息，供后续 balance scheduler 做调度决策。
+	for storeID := range affectedStores {
+		c.updateStoreStatusLocked(storeID)
+	}
 
 	return nil
 }

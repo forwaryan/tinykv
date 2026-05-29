@@ -14,8 +14,11 @@
 package schedulers
 
 import (
+	"sort"
+
 	"github.com/pingcap-incubator/tinykv/scheduler/server/core"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
+	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/filter"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/opt"
 )
@@ -43,6 +46,7 @@ type balanceRegionScheduler struct {
 	*baseScheduler
 	name         string
 	opController *schedule.OperatorController
+	filters      []filter.Filter
 }
 
 // newBalanceRegionScheduler 创建一个用于均衡各 store 上 Region 分布的 scheduler。
@@ -54,6 +58,9 @@ func newBalanceRegionScheduler(opController *schedule.OperatorController, opts .
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	s.filters = []filter.Filter{
+		filter.StoreStateFilter{ActionScope: s.GetName(), MoveRegion: true},
 	}
 	return s
 }
@@ -83,6 +90,82 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 // Lab3C 会在这里实现真正的 Region 均衡决策。
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
 	// Your Code Here (3C).
+	stores := cluster.GetStores()
+
+	sources := filter.SelectSourceStores(stores, s.filters, cluster)
+	targets := filter.SelectTargetStores(stores, s.filters, cluster)
+
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i].GetRegionSize() > sources[j].GetRegionSize()
+	})
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].GetRegionSize() < targets[j].GetRegionSize()
+	})
+
+	for _, source := range sources {
+		for i := 0; i < balanceRegionRetryLimit; i++ {
+			region := s.selectRegionToMove(cluster, source)
+			if region == nil {
+				break
+			}
+			if len(region.GetVoters()) != cluster.GetMaxReplicas() {
+				continue
+			}
+			if op := s.createMovePeerOperator(cluster, region, source, targets); op != nil {
+				return op
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *balanceRegionScheduler) selectRegionToMove(cluster opt.Cluster, source *core.StoreInfo) *core.RegionInfo {
+	sourceID := source.GetID()
+
+	if region := cluster.RandPendingRegion(sourceID, core.HealthRegionAllowPending()); region != nil {
+		return region
+	}
+	if region := cluster.RandFollowerRegion(sourceID, core.HealthRegion()); region != nil {
+		return region
+	}
+	return cluster.RandLeaderRegion(sourceID, core.HealthRegion())
+}
+
+func (s *balanceRegionScheduler) createMovePeerOperator(cluster opt.Cluster, region *core.RegionInfo, source *core.StoreInfo, targets []*core.StoreInfo) *operator.Operator {
+	sourceID := source.GetID()
+
+	for _, target := range targets {
+		targetID := target.GetID()
+		if targetID == sourceID {
+			continue
+		}
+		if region.GetStorePeer(targetID) != nil {
+			continue
+		}
+		if source.GetRegionSize()-target.GetRegionSize() <= 2*region.GetApproximateSize() {
+			return nil
+		}
+
+		newPeer, err := cluster.AllocPeer(targetID)
+		if err != nil {
+			continue
+		}
+
+		op, err := operator.CreateMovePeerOperator(
+			s.GetName(),
+			cluster,
+			region,
+			operator.OpBalance,
+			sourceID,
+			targetID,
+			newPeer.GetId(),
+		)
+		if err != nil {
+			continue
+		}
+		return op
+	}
 
 	return nil
 }
