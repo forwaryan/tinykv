@@ -31,6 +31,7 @@ graph LR
 | [Lab1：单机 KV](./labs/lab1-standalonekv.md) | 把 `RawGet` / `RawPut` / `RawDelete` / `RawScan` 翻译成 BadgerDB 的本地读写，顺便打好 `Storage` 和 CF 的基础 |
 | [Lab2：RaftKV](./labs/lab2-raftkv.md) | 写请求不再直接落盘，而是先进入 Raft log，等多数副本提交后再 apply 到 BadgerDB |
 | [Lab3：Multi-Raft](./labs/lab3-multiraftkv.md) | 一个大 Raft group 变成多个 Region，每个 Region 有自己的 Peer、Raft group、split 和调度流程 |
+| [Lab3B：split 状态收敛问题](./labs/lab3b-split-heartbeat-difficulty.md) | 记录 Lab3B 调试时遇到的 scheduler range gap、stopped peer 继续 apply、`KeyNotInRegion` 不稳定问题 |
 | [Lab4：事务](./labs/lab4-transactions.md) | 在 KV 之上实现 MVCC / Percolator 风格事务，用 `default`、`write`、`lock` 三个 CF 管理版本和锁 |
 | [测试指南](./labs/testing-guide.md) | 每个 Lab 跑什么 `make projectX` 命令，测试大概在检查哪些场景 |
 | [Lab 总路线](./labs/tinykv-lab-roadmap.md) | 按 Lab 串起来看：每一层在上一层基础上新增什么能力 |
@@ -211,8 +212,9 @@ graph TB
 1. 先看 [Lab1](./labs/lab1-standalonekv.md)：理解请求怎样从 Raw API 走到 Badger。
 2. 再看 [Lab2](./labs/lab2-raftkv.md)：理解写请求为什么要先进入 Raft log。
 3. 然后看 [Lab3](./labs/lab3-multiraftkv.md)：理解为什么要把 key 空间拆成多个 Region。
-4. 最后看 [Lab4](./labs/lab4-transactions.md)：这时思维要从“复制和分片”切到“数据库事务语义”，理解为什么一个 key 要保存多个版本，以及锁、提交记录、回滚如何配合。
-5. 需要跑实验时看 [测试指南](./labs/testing-guide.md)：先跑小阶段，再跑整组 `projectX`。
+4. 如果想看 Lab3B 的真实调试过程，再看 [Lab3B split 状态收敛问题](./labs/lab3b-split-heartbeat-difficulty.md)：它记录的是我们完成 Lab3B 时遇到的偶发失败和修复思路。
+5. 最后看 [Lab4](./labs/lab4-transactions.md)：这时思维要从“复制和分片”切到“数据库事务语义”，理解为什么一个 key 要保存多个版本，以及锁、提交记录、回滚如何配合。
+6. 需要跑实验时看 [测试指南](./labs/testing-guide.md)：先跑小阶段，再跑整组 `projectX`。
 
 ## 测试入口
 

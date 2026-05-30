@@ -169,6 +169,32 @@ Region 分裂 + 多客户端
 Region 分裂 + 网络分区
 ```
 
+本仓库还加了一个 Lab3B 辅助脚本：
+
+```bash
+scripts/test_lab3b.sh
+```
+
+它适合排查偶发失败，因为可以把某一组测试重复跑很多轮。常用方式：
+
+```bash
+# 跑 Lab3B split 相关测试 10 轮，不重复跑 Lab3A
+RUNS=10 SKIP_3A=1 scripts/test_lab3b.sh split
+
+# 跑 Lab3B conf change 相关测试 5 轮
+RUNS=5 SKIP_3A=1 scripts/test_lab3b.sh conf
+
+# 只跑最快的 smoke 测试
+RUNS=3 scripts/test_lab3b.sh smoke
+```
+
+如果正在查 split 相关问题，优先关注这两个测试：
+
+| 测试 | 重点 |
+|---|---|
+| `TestOneSplit3B` | split 后 left/right region 是否正确，越界 key 是否返回 `KeyNotInRegion` |
+| `TestSplitConfChangeSnapshotUnreliableRecoverConcurrentPartition3B` | split、conf change、snapshot、网络分区混在一起时状态是否还能收敛 |
+
 ## Lab4 测试
 
 总命令：

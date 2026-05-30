@@ -180,6 +180,24 @@ graph TB
 | `make project3c` | Lab3C | scheduler 能处理 Region heartbeat，并生成 balance-region operator |
 | `make project3` | Lab3 全部 | A/B/C 全部通过 |
 
+## 当前完成状态
+
+目前本地 Lab3 已经结束，可以按下面这张表理解进度：
+
+| 阶段 | 状态 | 我们完成了什么 | 对应提交 |
+|---|---|---|---|
+| Lab3A | 已完成 | Raft 层支持加 Peer、删 Peer、Leader Transfer | `7b6e8f2` |
+| Lab3B | 已完成并修复重点偶发失败 | raftstore 能执行 `ChangePeer`、`TransferLeader`、`Split`，并修复 split 后状态收敛问题 | `c67dcc9`、`7906b84` |
+| Lab3C | 已完成 | scheduler 能处理 Region heartbeat，并生成 balance region operator | `b606973` |
+
+如果用一句话总结：
+
+```text
+Lab3A 让一个 Raft 组能改成员。
+Lab3B 让 raftstore 真正用这些能力修改 Region。
+Lab3C 让 scheduler 站在全局视角决定什么时候搬 Region。
+```
+
 ## A 部分：Raft 组成员变化
 
 Lab2 里可以先理解成：一个 Raft 组的成员基本固定。Lab3 开始要支持动态变化。
@@ -386,6 +404,16 @@ Lab3A 主要改 Raft 层：
 
 这部分只是让 Raft 算法“具备能力”，真正把 Region 元信息改掉是在 Lab3B。
 
+我们本地完成 Lab3A 时，最重要的是补上这几条链路：
+
+| 链路 | 作用 |
+|---|---|
+| `ProposeConfChange -> EntryConfChange -> ApplyConfChange` | 让成员变化先进入 Raft log，再统一 apply |
+| `addNode/removeNode` | 真正修改 Raft 内部的 `Prs` 成员表 |
+| `TransferLeader -> MsgTimeoutNow` | 让旧 leader 指定某个 follower 尽快发起选举 |
+
+这里要注意：Lab3A 只负责 Raft 内部成员表和 leader transfer，不直接改 Region 的 key range，也不直接创建/销毁 raftstore peer。那些动作放在 Lab3B。
+
 ## B 部分：Region 分裂
 
 一个 Region 太大时，要拆成两个 Region。
@@ -535,6 +563,26 @@ Lab3B 主要改 raftstore：
 
 这部分的核心不是“复制 value”，而是让 Region 的范围、Peer 列表、RegionEpoch、storeMeta、router 注册关系都在 Raft 提交后一起变正确。
 
+我们本地完成 Lab3B 时，实际补的是这些关键点：
+
+| 功能 | 容易理解的说法 |
+|---|---|
+| `ChangePeer` | 收到 scheduler 的加/删 Peer 命令后，把它作为 Raft admin log 提交，再更新 Region 的 Peer 列表 |
+| `TransferLeader` | 收到转主命令后，让当前 leader 把 leader 位置交给目标 Peer |
+| `Split` | 一个 Region 太大时，向 scheduler 申请新 ID，然后把旧 Region 拆成 left/right 两段 |
+| `storeMeta` / `router` 更新 | 本地内存里的 Region 路由表也要同步更新，否则请求会找错 Region |
+| snapshot / destroy 处理 | 新 Peer 要能追数据，被删 Peer 要及时停掉，避免旧 Peer 继续处理日志 |
+
+Lab3B 最容易出问题的是“split 之后状态没有同时收敛”。也就是说，本地可能已经拆成 left/right 两个 Region，但 scheduler、router、peer 生命周期、请求入口检查还没有完全同步。我们遇到并整理过三个典型问题：
+
+| 问题 | 简短解释 |
+|---|---|
+| scheduler 暂时找不到 right region | split 后只上报 left，scheduler 先删掉 old region，right 还没上报，右半边 range 会短暂空出来 |
+| 被删 Peer 继续 apply | `RemoveNode` 删除自己后，这个 Peer 已经 stopped，但同一个 Ready 里后续日志不能再继续 apply |
+| 越界请求没有稳定返回 `KeyNotInRegion` | 普通 KV 请求不能只等 apply 阶段检查 key range，进入 Raft 前也要检查 |
+
+这几个问题的详细排查过程和修复思路记录在 [Lab3B split 状态收敛问题](./lab3b-split-heartbeat-difficulty.md)。
+
 ## C 部分：调度器
 
 调度器有点像 TiKV 里的 PD。
@@ -617,6 +665,27 @@ Lab3C 主要改 scheduler：
 | `scheduler/server/schedule/operator` | 理解 `MovePeer` operator 如何拆成 AddPeer / TransferLeader / RemovePeer |
 
 一句话：Lab3B 是节点执行管理命令，Lab3C 是调度器决定该给哪些节点发管理命令。
+
+我们本地完成 Lab3C 时，主要补的是这条链路：
+
+```text
+Region heartbeat
+  -> cluster 更新 Region/Store 缓存
+  -> balance-region scheduler 找出最忙和最空的 Store
+  -> 选择一个适合搬迁的 Region
+  -> 创建 MovePeer operator
+  -> operator 后续拆成 AddPeer / TransferLeader / RemovePeer
+```
+
+换成人话就是：
+
+```text
+节点告诉 scheduler：“我这里有哪些 Region。”
+scheduler 统计以后发现：“这个 Store 太满，那个 Store 太空。”
+scheduler 返回一个搬迁计划：“先在空 Store 加副本，追上后再删掉满 Store 的旧副本。”
+```
+
+所以 Lab3C 的核心不是自己搬数据，而是生成一个正确的计划。真正执行计划时，还是回到 Lab3A/Lab3B 的成员变更能力。
 
 ## A/B/C 串起来看
 
@@ -723,6 +792,25 @@ raft/rawnode_test.go
 kv/test_raftstore/test_test.go
 scheduler/server/cluster_test.go
 scheduler/server/schedulers/balance_test.go
+```
+
+本地收尾时重点回归过之前最容易失败的两个 Lab3B 测试：
+
+| 测试 | 最近验证结果 | 为什么重点看它 |
+|---|---|---|
+| `TestOneSplit3B` | 10/10 PASS | 会检查 split 后 left/right region 是否正确，以及越界请求是否返回 `KeyNotInRegion` |
+| `TestSplitConfChangeSnapshotUnreliableRecoverConcurrentPartition3B` | 10/10 PASS | 会把 split、conf change、snapshot、网络不可靠和分区揉在一起，最容易暴露状态收敛问题 |
+
+我们还新增了一个本地辅助脚本：
+
+```bash
+scripts/test_lab3b.sh
+```
+
+它可以多轮跑 Lab3B 的 smoke/conf/split/all 测试，适合排查偶发失败。比如只跑 split 相关测试 10 轮：
+
+```bash
+RUNS=10 SKIP_3A=1 scripts/test_lab3b.sh split
 ```
 
 更完整的测试命令在 [测试指南](./testing-guide.md)。
