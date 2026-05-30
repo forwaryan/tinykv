@@ -71,6 +71,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 	for _, entry := range rd.CommittedEntries {
 		d.applyEntry(entry)
+		if d.stopped {
+			return
+		}
 	}
 
 	d.RaftGroup.Advance(rd)
@@ -365,8 +368,30 @@ func (d *peerMsgHandler) applySplit(entry eraftpb.Entry, req *raft_cmdpb.RaftCmd
 		},
 	}
 
+	// if parentWasLeader {
+	// 	d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	// }
 	if parentWasLeader {
-		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		d.notifyHeartbeatScheduler(left, d.peer)
+		d.notifyHeartbeatScheduler(right, newPeer)
+	}
+}
+
+func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *peer) {
+	if region == nil || peer == nil {
+		return
+	}
+
+	clonedRegion := new(metapb.Region)
+	if err := util.CloneMsg(region, clonedRegion); err != nil {
+		return
+	}
+
+	d.ctx.schedulerTaskSender <- &runner.SchedulerRegionHeartbeatTask{
+		Region:          clonedRegion,
+		Peer:            peer.Meta,
+		PendingPeers:    peer.CollectPendingPeers(),
+		ApproximateSize: peer.ApproximateSize,
 	}
 }
 
@@ -589,7 +614,31 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 		}
 		return errEpochNotMatching
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	if req.GetAdminRequest() == nil {
+		for _, r := range req.GetRequests() {
+			var key []byte
+			switch r.GetCmdType() {
+			case raft_cmdpb.CmdType_Get:
+				key = r.GetGet().GetKey()
+			case raft_cmdpb.CmdType_Put:
+				key = r.GetPut().GetKey()
+			case raft_cmdpb.CmdType_Delete:
+				key = r.GetDelete().GetKey()
+			}
+
+			if key != nil {
+				if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // proposeRaftCommand 是客户端/admin 命令进入当前 Region Raft group 的入口。
