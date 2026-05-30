@@ -7,6 +7,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/latches"
+	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
 	coppb "github.com/pingcap-incubator/tinykv/proto/pkg/coprocessor"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/tinykvpb"
@@ -53,21 +54,193 @@ func (server *Server) Snapshot(stream tinykvpb.TinyKv_SnapshotServer) error {
 // 它应该按指定版本读取 MVCC lock/write/value，并返回可见 value 或 key error。
 func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcpb.GetResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	resp := new(kvrpcpb.GetResponse)
+
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+
+	txn := mvcc.NewMvccTxn(reader, req.Version)
+
+	lock, err := txn.GetLock(req.Key)
+	if err != nil {
+		return nil, err
+	}
+	if lock.IsLockedFor(req.Key, req.Version, resp) {
+		return resp, nil
+	}
+
+	value, err := txn.GetValue(req.Key)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		resp.NotFound = true
+		return resp, nil
+	}
+
+	resp.Value = value
+	return resp, nil
 }
 
 // KvPrewrite 实现 Percolator 两阶段提交的第一阶段。
 // 它应该检查冲突、写 lock，并保存临时 value。
 func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	resp := new(kvrpcpb.PrewriteResponse)
+
+	keys := make([][]byte, 0, len(req.Mutations))
+	for _, mut := range req.Mutations {
+		keys = append(keys, mut.Key)
+	}
+
+	server.Latches.WaitForLatches(keys)
+	defer server.Latches.ReleaseLatches(keys)
+
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+
+	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
+
+	for _, mut := range req.Mutations {
+		lock, err := txn.GetLock(mut.Key)
+		if err != nil {
+			return nil, err
+		}
+		if lock != nil {
+			resp.Errors = append(resp.Errors, &kvrpcpb.KeyError{
+				Locked: lock.Info(mut.Key),
+			})
+			continue
+		}
+
+		write, commitTs, err := txn.MostRecentWrite(mut.Key)
+		if err != nil {
+			return nil, err
+		}
+		if write != nil && commitTs >= req.StartVersion {
+			resp.Errors = append(resp.Errors, &kvrpcpb.KeyError{
+				Conflict: &kvrpcpb.WriteConflict{
+					StartTs:    req.StartVersion,
+					ConflictTs: commitTs,
+					Key:        mut.Key,
+					Primary:    req.PrimaryLock,
+				},
+			})
+			continue
+		}
+
+		switch mut.Op {
+		case kvrpcpb.Op_Put:
+			txn.PutValue(mut.Key, mut.Value)
+		case kvrpcpb.Op_Del:
+			txn.DeleteValue(mut.Key)
+		}
+
+		txn.PutLock(mut.Key, &mvcc.Lock{
+			Primary: req.PrimaryLock,
+			Ts:      req.StartVersion,
+			Ttl:     req.LockTtl,
+			Kind:    mvcc.WriteKindFromProto(mut.Op),
+		})
+	}
+
+	if len(resp.Errors) > 0 {
+		return resp, nil
+	}
+
+	if err := server.storage.Write(req.Context, txn.Writes()); err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 // KvCommit 实现两阶段提交的第二阶段。
 // 它应该把 Prewrite 阶段写入的 lock 转成已提交的 write record。
 func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*kvrpcpb.CommitResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	resp := new(kvrpcpb.CommitResponse)
+
+	server.Latches.WaitForLatches(req.Keys)
+	defer server.Latches.ReleaseLatches(req.Keys)
+
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+
+	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
+
+	for _, key := range req.Keys {
+		write, _, err := txn.CurrentWrite(key)
+		if err != nil {
+			return nil, err
+		}
+		if write != nil {
+			if write.Kind == mvcc.WriteKindRollback {
+				resp.Error = &kvrpcpb.KeyError{
+					Abort: "transaction has been rolled back",
+				}
+				return resp, nil
+			}
+			continue
+		}
+
+		lock, err := txn.GetLock(key)
+		if err != nil {
+			return nil, err
+		}
+		if lock == nil {
+			continue
+		}
+		if lock.Ts != req.StartVersion {
+			resp.Error = &kvrpcpb.KeyError{
+				Retryable: "lock belongs to another transaction",
+			}
+			return resp, nil
+		}
+
+		txn.PutWrite(key, req.CommitVersion, &mvcc.Write{
+			StartTS: req.StartVersion,
+			Kind:    lock.Kind,
+		})
+		txn.DeleteLock(key)
+	}
+
+	server.Latches.Validate(txn, req.Keys)
+
+	if err := server.storage.Write(req.Context, txn.Writes()); err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 // KvScan 使用 MVCC scanner 实现 Lab4C 的版本化范围读取。

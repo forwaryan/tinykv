@@ -419,6 +419,66 @@ Prewrite 时还没有 `commit_ts`，所以检查方式是：
 如果有，就说明我开始之后别人提交过这个 key，产生 write conflict。
 ```
 
+这里说的“覆盖”不是把 `default CF` 里的旧 value 物理覆盖掉。MVCC 会保留多个版本，例如：
+
+```text
+default CF:
+  x@20 -> 101
+  x@25 -> 200
+```
+
+真正的问题是逻辑上的覆盖。因为读请求是先看 `write CF`，而 `write CF` 同一个 user key 下是按 `commit_ts` 从新到旧找版本的。谁的 `commit_ts` 更大，谁就会被后续读请求当成更新版本。
+
+举个例子：
+
+```text
+事务 B:
+  start_ts = 20
+  读到旧值 x = 100
+  准备写 x = 101
+
+事务 A:
+  start_ts = 25
+  commit_ts = 30
+  已经提交 x = 200
+```
+
+如果不做写冲突检查，让事务 B 继续提交，并且 B 最后拿到：
+
+```text
+B commit_ts = 40
+```
+
+那么 `write CF` 会变成：
+
+```text
+x@40 -> Write{start_ts=20, kind=Put}  // B
+x@30 -> Write{start_ts=25, kind=Put}  // A
+```
+
+之后别人读取 `version = 50` 时，会先看到 `x@40`，于是读到 B 的 `x@20 -> 101`。这样 A 已经提交的 `x@25 -> 200` 虽然物理上还在，但在最新读视角里被 B 盖过去了。
+
+所以写冲突检查要阻止这种情况：
+
+```text
+我的 start_ts 之后，如果别人已经提交过同一个 key，
+我就不能再提交这个 key。
+```
+
+也就是：
+
+```text
+MostRecentWrite(key) 的 commit_ts >= 当前事务 start_ts
+=> WriteConflict
+```
+
+可以这样区分读和写：
+
+```text
+读：未来版本看不见，可以跳过。
+写：如果 start_ts 之后已经有人提交同一个 key，不能跳过，必须报冲突。
+```
+
 图上看：
 
 ```mermaid
