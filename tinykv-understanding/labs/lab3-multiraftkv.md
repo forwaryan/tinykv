@@ -190,6 +190,8 @@ graph TB
 | Lab3B | 已完成并修复重点偶发失败 | raftstore 能执行 `ChangePeer`、`TransferLeader`、`Split`，并修复 split 后状态收敛问题 | `c67dcc9`、`7906b84` |
 | Lab3C | 已完成 | scheduler 能处理 Region heartbeat，并生成 balance region operator | `b606973` |
 
+最近一次本地完整回归里，`make project3` 已通过。由于 `project3b` 里的子测试也带有 `|| true`，验证时除了看命令结束状态，还扫了完整日志，确认没有 `FAIL`、`panic`、`fatal error`。
+
 如果用一句话总结：
 
 ```text
@@ -197,6 +199,17 @@ Lab3A 让一个 Raft 组能改成员。
 Lab3B 让 raftstore 真正用这些能力修改 Region。
 Lab3C 让 scheduler 站在全局视角决定什么时候搬 Region。
 ```
+
+本地讨论里 Lab3 最值得记住的是这条主线：
+
+```text
+Lab2 已经能复制一个 Region 的日志。
+Lab3A 让这个 Region 的副本集合可以变化。
+Lab3B 让 Region 可以被 split 成两个范围。
+Lab3C 让 scheduler 根据 heartbeat 决定副本怎么搬。
+```
+
+也就是说，Lab3 不是重新做一个 KV，而是在 Lab2 的 RaftKV 上补齐“多 Region 管理能力”。
 
 ## A 部分：Raft 组成员变化
 

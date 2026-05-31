@@ -215,6 +215,38 @@ MVCC
 
 它只负责把单机存储这块地基打好。
 
+## 本地实现记录
+
+本地这份实现里，Lab1 已经完成并通过最近一次回归：
+
+```bash
+make project1
+```
+
+理解 Lab1 时可以把它压成三层：
+
+| 层次 | 本地代码里主要看哪里 | 要抓住的点 |
+|---|---|---|
+| RPC 层 | `kv/server/raw_api.go` | 把 `RawGet/RawPut/RawDelete/RawScan` 请求翻译成 storage 调用 |
+| Storage 抽象层 | `kv/storage/storage.go`、`kv/storage/standalone_storage/standalone_storage.go` | 上层只面对 `Reader` 和 `Write`，不直接依赖 Badger 细节 |
+| engine 工具层 | `kv/util/engine_util` | 负责 CF 编码、读写 Badger、创建 iterator |
+
+复习时建议按这个顺序看：
+
+```text
+先看 Raw API 收到请求后调用了什么
+  -> 再看 StandaloneStorage 怎么创建 reader 和执行 batch write
+  -> 最后看 engine_util 怎么把 CF 和 key 映射到底层 Badger key
+```
+
+Lab1 在后续 Lab 里的作用也很明确：
+
+| 后续 Lab | 复用 Lab1 的什么 |
+|---|---|
+| Lab2 | 复用本地 `Storage` 抽象，不过写请求会先经过 Raft |
+| Lab3 | 复用底层 KV/raftstore apply 能力，只是 key 空间会被 Region 切开 |
+| Lab4 | 复用 CF 能力，事务层会大量使用 `default/write/lock` 三个 CF |
+
 ## 怎么测试
 
 在 TinyKV 源码根目录运行：

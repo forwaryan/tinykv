@@ -61,6 +61,23 @@ go test -v --count=1 --parallel=1 -p=1 ./kv/server -run 1
 FAIL
 ```
 
+本地完整回归时建议直接把日志落盘，再统一扫失败关键字：
+
+```bash
+make project1 2>&1 | tee /tmp/tinykv-project1.log
+make project2 2>&1 | tee /tmp/tinykv-project2.log
+make project3 2>&1 | tee /tmp/tinykv-project3.log
+make project4 2>&1 | tee /tmp/tinykv-project4.log
+
+grep -nE '(^--- FAIL:|^FAIL( |$)|panic:|fatal error:)' \
+  /tmp/tinykv-project1.log \
+  /tmp/tinykv-project2.log \
+  /tmp/tinykv-project3.log \
+  /tmp/tinykv-project4.log
+```
+
+如果 `grep` 没有输出，并且各个命令本身也没有异常中断，就可以更有把握地说 Lab1 到 Lab4 都通过了。
+
 ## Lab1 测试
 
 命令：

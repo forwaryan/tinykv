@@ -96,6 +96,42 @@ Part C 做“日志太多以后怎么减肥”
 
 所以 `2AA` 不是一个独立的大 Lab，它只是 `2A` 里的第一个检查点。过了 `2AA`，只能说明“选主这块基本通了”，还不能说 Lab2A 完成。
 
+## 本地实现记录
+
+本地这份实现里，Lab2 已经完成并通过最近一次完整回归：
+
+```bash
+make project2
+```
+
+回归时额外注意过一点：`project2b` 和 `project2c` 在 Makefile 里部分子测试带了 `|| true`，所以不能只看最后的退出码，还要扫日志里有没有 `FAIL`、`panic`、`fatal error`。
+
+本地学习和实现顺序可以这样复盘：
+
+| 顺序 | 阶段 | 当时主要在解决什么 |
+|---|---|---|
+| 1 | Lab2A / 2AA | 先让 Raft 节点能选主、投票、发心跳 |
+| 2 | Lab2A / 2AB | 再让 leader 能复制日志、处理冲突、推进 commit |
+| 3 | Lab2A / 2AC | 把 Raft 包成 `RawNode`，通过 `Ready/Advance` 和上层交互 |
+| 4 | Lab2B | 把 KV command 放进 Raft，apply 后再写 Badger 并回调客户端 |
+| 5 | Lab2C | 加上 log GC、snapshot 生成和落后副本恢复 |
+
+可以把 Lab2 的代码分界记成下面这样：
+
+| 代码区域 | 属于哪层 | 判断方式 |
+|---|---|---|
+| `raft/raft.go`、`raft/log.go`、`raft/rawnode.go` | Raft 算法层 | 只处理 term、vote、log、commit、message，不知道 KV 是什么 |
+| `kv/raftstore/peer_storage.go` | Raft 持久化层 | 负责把 Raft log、HardState、snapshot 和底层存储接起来 |
+| `kv/raftstore/peer_msg_handler.go` | raftstore 驱动层 | 负责 propose、处理 Ready、apply committed entries、响应客户端 |
+
+一句话总结本地讨论里的重点：
+
+```text
+Lab2A 先把“多数派同意同一串日志”做出来；
+Lab2B 再把“KV 请求必须进入这串日志”接上；
+Lab2C 最后处理“日志不能无限长，落后副本要靠快照追上”。
+```
+
 ## A 部分：实现 Raft
 
 相关代码：

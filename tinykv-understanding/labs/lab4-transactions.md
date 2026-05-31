@@ -233,6 +233,40 @@ graph LR
 
 Lab4 的代码容易看晕，可以先记住分层：`mvcc` 包提供“怎么操作版本和锁”的工具，`server.go` 里的事务 handler 负责“什么时候调用这些工具”。
 
+## 当前本地状态
+
+本地这份 Lab4 已经完成并通过最近一次完整回归：
+
+```bash
+make project4
+```
+
+当前实现可以按提交和代码范围这样理解：
+
+| 阶段 | 本地提交 | 主要改动 | 粗略代码量 |
+|---|---|---|---|
+| Lab4A | `8c8bf3e` | 补齐 `MvccTxn` 的 lock/write/default 读写和版本查询工具 | 主要在 `transaction.go`，约一百多行 |
+| Lab4B | `791722a` | 实现 `KvGet`、`KvPrewrite`、`KvCommit` 的事务正常路径 | 主要在 `server.go`，约一百多行 |
+| Lab4C-1 | `d137e5a` | 实现 `KvScan`、`KvBatchRollback` 和 scanner 逻辑 | 约两百行改动 |
+| Lab4C-2 | `9e4c8cb` | 实现 `KvCheckTxnStatus`、`KvResolveLock` | 约一百多行改动 |
+
+所以之前问“Lab4C 代码量大不大”时，可以这样记：
+
+```text
+Lab4C 不算概念最大，但分支情况最多。
+两次提交合起来大概三百多行改动，是 Lab4 里偏大的部分，因为它同时处理 scan、rollback、check status、resolve lock。
+真正难点不是写很多代码，而是把已提交、已回滚、锁存在、锁超时、锁不存在这些状态分清楚。
+```
+
+本地实际推进顺序是：
+
+```text
+先完成 Lab4A 的 MVCC 基础工具
+  -> 再做 Lab4B 的正常事务路径
+  -> 然后做 Lab4C 的 scan 和 rollback
+  -> 最后补 CheckTxnStatus 和 ResolveLock
+```
+
 ## Part A：MVCC 存储层
 
 Part A 主要实现 `MvccTxn`。

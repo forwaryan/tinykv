@@ -35,6 +35,28 @@ Lab1: 单机 KV
 | Lab4B | Project4 Part B | `KvGet`、`KvPrewrite`、`KvCommit` | `make project4b` |
 | Lab4C | Project4 Part C | `KvScan`、rollback、check/resolve lock | `make project4c` |
 
+## 本地当前进度
+
+结合最近的本地对话和回归结果，现在可以把这个仓库的进度看成：
+
+| Lab | 当前状态 | 最近验证 |
+|---|---|---|
+| Lab1 | 已完成 | `make project1` 通过 |
+| Lab2 | 已完成 | `make project2` 通过，并额外检查日志无失败关键字 |
+| Lab3 | 已完成 | `make project3` 通过，并额外检查日志无失败关键字 |
+| Lab4 | 已完成 | `make project4` 通过，Lab4A/B/C 全部 PASS |
+
+这里特别要记住：Lab2B、Lab2C、Lab3B 的 Makefile 子命令里有 `|| true`，所以“完整通过”的判断不是只看 `make` 退出码，而是还要确认输出或日志里没有 `FAIL`、`panic`、`fatal error`。
+
+从学习路径上看，我们本地对话基本是按这条线推进的：
+
+```text
+先理解每个 Lab 要做什么
+  -> 再按 Lab4A/B/C 拆开实现事务
+  -> 每完成一段就补代码注释和中文 commit 描述
+  -> 最后从 Lab1 到 Lab4 全量回归确认
+```
+
 和 MIT 6.5840 的大致关系：
 
 ```text
