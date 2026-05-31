@@ -295,8 +295,80 @@ func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrp
 // KvCheckTxnStatus 检查 primary lock 是否已提交、已回滚或已超时。
 // 必要时它会清理超时 lock。
 func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
-	// Your Code Here (4C).
-	return nil, nil
+	resp := new(kvrpcpb.CheckTxnStatusResponse)
+
+	// CheckTxnStatus 可能写 rollback record 或清理 primary lock，所以要 latch primary key。
+	keys := [][]byte{req.PrimaryKey}
+	server.Latches.WaitForLatches(keys)
+	defer server.Latches.ReleaseLatches(keys)
+
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+
+	txn := mvcc.NewMvccTxn(reader, req.LockTs)
+
+	// 先看 primary key 是否已经有当前事务的 write record。
+	// 如果有，说明事务状态已经确定，不需要再看 lock。
+	write, commitTs, err := txn.CurrentWrite(req.PrimaryKey)
+	if err != nil {
+		return nil, err
+	}
+	if write != nil {
+		if write.Kind != mvcc.WriteKindRollback {
+			// Put/Delete write 表示事务已经提交，返回对应 commit timestamp。
+			resp.CommitVersion = commitTs
+		}
+		// Rollback write 表示事务已经回滚；CommitVersion 保持 0 即可。
+		resp.Action = kvrpcpb.Action_NoAction
+		return resp, nil
+	}
+
+	// 没有 write record 时，再检查 primary lock 是否仍然存在。
+	lock, err := txn.GetLock(req.PrimaryKey)
+	if err != nil {
+		return nil, err
+	}
+
+	if lock == nil || lock.Ts != req.LockTs {
+		// primary lock 不存在，客户端会把该事务视为已回滚；这里补 rollback record 防止迟到 Commit。
+		txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
+			StartTS: req.LockTs,
+			Kind:    mvcc.WriteKindRollback,
+		})
+		resp.Action = kvrpcpb.Action_LockNotExistRollback
+	} else if mvcc.PhysicalTime(lock.Ts)+lock.Ttl > mvcc.PhysicalTime(req.CurrentTs) {
+		// lock 还没过期，不能替它做决定，只把剩余 TTL 语义返回给客户端等待/重试。
+		resp.LockTtl = lock.Ttl
+		resp.Action = kvrpcpb.Action_NoAction
+	} else {
+		// lock 已过期：回滚 primary key，清理 Prewrite 留下的 lock/default，并写 rollback record。
+		txn.DeleteLock(req.PrimaryKey)
+		txn.DeleteValue(req.PrimaryKey)
+		txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
+			StartTS: req.LockTs,
+			Kind:    mvcc.WriteKindRollback,
+		})
+		resp.Action = kvrpcpb.Action_TTLExpireRollback
+	}
+
+	server.Latches.Validate(txn, keys)
+
+	if err := server.storage.Write(req.Context, txn.Writes()); err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 // KvBatchRollback 回滚同一个 start timestamp 下的一批 key。
@@ -374,8 +446,68 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 
 // KvResolveLock 根据 CommitVersion 决定提交或回滚某个事务留下的所有 lock。
 func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
-	// Your Code Here (4C).
-	return nil, nil
+	resp := new(kvrpcpb.ResolveLockResponse)
+
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+
+	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
+
+	// ResolveLock 不带具体 keys，需要扫描 lock CF 找出这个 start_ts 事务留下的全部 lock。
+	locks, err := mvcc.AllLocksForTxn(txn)
+	if err != nil {
+		return nil, err
+	}
+
+	// 拿到所有待处理 lock 后，再 latch 这些 key，避免和并发 Commit/Rollback 交错写。
+	keys := make([][]byte, 0, len(locks))
+	for _, pair := range locks {
+		keys = append(keys, pair.Key)
+	}
+
+	server.Latches.WaitForLatches(keys)
+	defer server.Latches.ReleaseLatches(keys)
+
+	for _, pair := range locks {
+		key := pair.Key
+		lock := pair.Lock
+
+		if req.CommitVersion == 0 {
+			// CommitVersion 为 0 表示事务最终要回滚：删 lock、删临时 value、写 rollback record。
+			txn.DeleteLock(key)
+			txn.DeleteValue(key)
+			txn.PutWrite(key, req.StartVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    mvcc.WriteKindRollback,
+			})
+		} else {
+			// CommitVersion 非 0 表示事务最终提交：保留 default value，写正式 write record，再删 lock。
+			txn.PutWrite(key, req.CommitVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    lock.Kind,
+			})
+			txn.DeleteLock(key)
+		}
+	}
+
+	server.Latches.Validate(txn, keys)
+
+	if err := server.storage.Write(req.Context, txn.Writes()); err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 // Coprocessor 处理 SQL pushdown 请求。
