@@ -46,7 +46,7 @@ func (txn *MvccTxn) Writes() []storage.Modify {
 // PutWrite 在指定 key 和 commit timestamp 下写入一条 Write 记录。
 // Lab4A 会把 key 和 ts 编码后，把序列化 Write 存到 write CF。
 func (txn *MvccTxn) PutWrite(key []byte, ts uint64, write *Write) {
-	// Your Code Here (4A).
+	// write CF 使用 commit_ts 编码 key，value 里记录真正 value 的 start_ts。
 	txn.writes = append(txn.writes, storage.Modify{
 		Data: storage.Put{
 			Cf:    engine_util.CfWrite,
@@ -59,7 +59,7 @@ func (txn *MvccTxn) PutWrite(key []byte, ts uint64, write *Write) {
 // GetLock 读取 key 上的 lock。
 // 没有 lock 时返回 nil；lock 存在于 lock CF，key 使用原始 user key。
 func (txn *MvccTxn) GetLock(key []byte) (*Lock, error) {
-	// Your Code Here (4A).
+	// lock CF 直接用原始 user key 查询，不带 timestamp。
 	value, err := txn.Reader.GetCF(engine_util.CfLock, key)
 	if err != nil {
 		return nil, err
@@ -73,7 +73,7 @@ func (txn *MvccTxn) GetLock(key []byte) (*Lock, error) {
 // PutLock 给当前事务追加一个写 lock 的修改。
 // server 之后会把这个修改统一写入底层 storage。
 func (txn *MvccTxn) PutLock(key []byte, lock *Lock) {
-	// Your Code Here (4A).
+	// lock 表示该 key 已被 start_ts 对应事务预写，提交或回滚前会阻塞其它事务。
 	txn.writes = append(txn.writes, storage.Modify{
 		Data: storage.Put{
 			Cf:    engine_util.CfLock,
@@ -86,7 +86,7 @@ func (txn *MvccTxn) PutLock(key []byte, lock *Lock) {
 // DeleteLock 给当前事务追加一个删除 lock 的修改。
 // 提交或回滚某个 key 后，需要删除 lock CF 中的对应记录。
 func (txn *MvccTxn) DeleteLock(key []byte) {
-	// Your Code Here (4A).
+	// 删除 lock 只清理 lock CF；default/write CF 的状态由 Commit 或 Rollback 决定。
 	txn.writes = append(txn.writes, storage.Modify{
 		Data: storage.Delete{
 			Cf:  engine_util.CfLock,
@@ -98,10 +98,10 @@ func (txn *MvccTxn) DeleteLock(key []byte) {
 // GetValue 读取在当前事务 start timestamp 可见的 key/value。
 // 它需要找到 startTs 之前最近提交的 write record，再去 default CF 读取真实 value。
 func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
-	// Your Code Here (4A).
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	defer iter.Close()
 
+	// 从 key@StartTS 往后扫，第一条 Put/Delete write 就决定当前快照能否看到 value。
 	for iter.Seek(EncodeKey(key, txn.StartTS)); iter.Valid(); iter.Next() {
 		item := iter.Item()
 		itemKey := item.Key()
@@ -122,10 +122,13 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 
 		switch write.Kind {
 		case WriteKindPut:
+			// write record 指向 default CF 中 key@write.StartTS 的真实 value。
 			return txn.Reader.GetCF(engine_util.CfDefault, EncodeKey(key, write.StartTS))
 		case WriteKindDelete:
+			// Delete write 表示当前快照下该 key 已不存在。
 			return nil, nil
 		case WriteKindRollback:
+			// Rollback record 不是可见版本，继续找更老的 write。
 			continue
 		}
 	}
@@ -136,7 +139,7 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 // PutValue 给当前事务追加一个写 default CF value 的修改。
 // 临时 value 会用事务 start timestamp 编码保存。
 func (txn *MvccTxn) PutValue(key []byte, value []byte) {
-	// Your Code Here (4A).
+	// Prewrite 的临时 value 存在 default CF，key 使用事务 start_ts 编码。
 	txn.writes = append(txn.writes, storage.Modify{
 		Data: storage.Put{
 			Cf:    engine_util.CfDefault,
@@ -148,7 +151,7 @@ func (txn *MvccTxn) PutValue(key []byte, value []byte) {
 
 // DeleteValue 给当前事务追加一个删除 default CF value 的修改。
 func (txn *MvccTxn) DeleteValue(key []byte) {
-	// Your Code Here (4A).
+	// Rollback 会删除同一 start_ts 下的临时 value，避免未提交数据残留。
 	txn.writes = append(txn.writes, storage.Modify{
 		Data: storage.Delete{
 			Cf:  engine_util.CfDefault,
@@ -160,10 +163,10 @@ func (txn *MvccTxn) DeleteValue(key []byte) {
 // CurrentWrite 查找当前事务 start timestamp 对应的 write record。
 // commit 和 rollback 会用它保证重复请求是幂等的。
 func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
-	// Your Code Here (4A).
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	defer iter.Close()
 
+	// 扫描该 key 的所有 write record，找 StartTS 等于当前事务的那条。
 	for iter.Seek(EncodeKey(key, TsMax)); iter.Valid(); iter.Next() {
 		item := iter.Item()
 		itemKey := item.Key()
@@ -193,10 +196,10 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 // MostRecentWrite 查找某个 key 最新的一条 write record。
 // Prewrite 会用它检测是否存在比当前事务 startTs 更新的写冲突。
 func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
-	// Your Code Here (4A).
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	defer iter.Close()
 
+	// TsMax 会定位到该 user key 最新的 write record，用于 Prewrite 检查写冲突。
 	iter.Seek(EncodeKey(key, TsMax))
 	if !iter.Valid() {
 		return nil, 0, nil
